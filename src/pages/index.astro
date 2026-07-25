@@ -1,0 +1,301 @@
+---
+import { Image } from 'astro:assets';
+import { getCollection } from 'astro:content';
+import BaseHead from '../components/BaseHead.astro';
+import Footer from '../components/Footer.astro';
+import FormattedDate from '../components/FormattedDate.astro';
+import Header from '../components/Header.astro';
+import {
+	SITE_DESCRIPTION,
+	SITE_TAGLINE,
+	SITE_TITLE,
+	SOCIAL_LINKS,
+} from '../consts';
+
+const posts = (await getCollection('blog')).sort(
+	(a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf(),
+);
+
+// Featured row: curated via the `featured` flag, newest first (cap at 3).
+const featured = posts.filter((post) => post.data.featured).slice(0, 3);
+// Recent list: the latest posts regardless of featured status.
+const recent = posts.slice(0, 5);
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<BaseHead title={SITE_TITLE} description={SITE_DESCRIPTION} />
+		<style>
+			main {
+				width: 960px;
+			}
+
+			/* Hero */
+			.hero {
+				padding: 2rem 0 3rem;
+				border-bottom: 1px solid rgb(var(--gray-light));
+				margin-bottom: 3rem;
+			}
+			.hero h1 {
+				font-size: 2.8rem;
+				margin-bottom: 0.25rem;
+			}
+			.hero .tagline {
+				color: rgb(var(--gray));
+				font-size: 1.2rem;
+				margin: 0 0 1rem;
+			}
+			.hero p.intro {
+				max-width: 46ch;
+				margin: 0 0 1.5rem;
+			}
+			.hero-links {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.75rem;
+			}
+			.hero-links a {
+				display: inline-block;
+				padding: 0.5rem 1.1rem;
+				border-radius: 8px;
+				text-decoration: none;
+				font-size: 1rem;
+				border: 1px solid rgb(var(--gray-light));
+				color: rgb(var(--gray-dark));
+				transition: 0.2s ease;
+			}
+			.hero-links a:hover {
+				border-color: var(--accent);
+				color: var(--accent);
+			}
+			.hero-links a.primary {
+				background: var(--accent);
+				border-color: var(--accent);
+				color: #fff;
+			}
+			.hero-links a.primary:hover {
+				background: var(--accent-dark);
+				border-color: var(--accent-dark);
+				color: #fff;
+			}
+
+			/* Section headers */
+			.section-head {
+				display: flex;
+				align-items: baseline;
+				justify-content: space-between;
+				margin-bottom: 1.25rem;
+			}
+			.section-head h2 {
+				margin: 0;
+				font-size: 1.6rem;
+			}
+			.section-head a {
+				font-size: 0.95rem;
+				text-decoration: none;
+			}
+			.section-head a:hover {
+				text-decoration: underline;
+			}
+
+			/* Featured cards */
+			.featured-grid {
+				display: grid;
+				grid-template-columns: repeat(3, 1fr);
+				gap: 1.5rem;
+				margin: 0 0 3.5rem;
+				padding: 0;
+				list-style: none;
+			}
+			.card {
+				display: flex;
+				flex-direction: column;
+				border: 1px solid rgb(var(--gray-light));
+				border-radius: 12px;
+				overflow: hidden;
+				transition: 0.2s ease;
+				height: 100%;
+			}
+			.card a {
+				text-decoration: none;
+				color: inherit;
+				display: flex;
+				flex-direction: column;
+				height: 100%;
+			}
+			.card img {
+				width: 100%;
+				aspect-ratio: 16 / 9;
+				object-fit: cover;
+				border-radius: 0;
+			}
+			.card .card-body {
+				padding: 1rem 1.1rem 1.25rem;
+				display: flex;
+				flex-direction: column;
+				gap: 0.5rem;
+				flex: 1;
+			}
+			.card .card-title {
+				font-size: 1.15rem;
+				line-height: 1.25;
+				color: rgb(var(--black));
+			}
+			.card .card-desc {
+				font-size: 0.95rem;
+				color: rgb(var(--gray-dark));
+				margin: 0;
+				flex: 1;
+			}
+			.card:hover {
+				border-color: var(--accent);
+				box-shadow: var(--box-shadow);
+			}
+			.card:hover .card-title {
+				color: var(--accent);
+			}
+
+			/* Tags */
+			.tags {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.4rem;
+			}
+			.tag {
+				font-size: 0.75rem;
+				padding: 0.15rem 0.6rem;
+				border-radius: 999px;
+				background: rgb(var(--gray-light));
+				color: rgb(var(--gray-dark));
+			}
+
+			/* Recent list */
+			.recent-list {
+				list-style: none;
+				margin: 0;
+				padding: 0;
+			}
+			.recent-list li {
+				border-bottom: 1px solid rgb(var(--gray-light));
+			}
+			.recent-list li:first-child {
+				border-top: 1px solid rgb(var(--gray-light));
+			}
+			.recent-list a {
+				display: flex;
+				align-items: baseline;
+				justify-content: space-between;
+				gap: 1rem;
+				padding: 0.9rem 0.25rem;
+				text-decoration: none;
+				color: rgb(var(--black));
+				transition: 0.2s ease;
+			}
+			.recent-list a:hover {
+				color: var(--accent);
+				padding-left: 0.6rem;
+			}
+			.recent-list .r-title {
+				font-size: 1.1rem;
+			}
+			.recent-list .r-date {
+				color: rgb(var(--gray));
+				font-size: 0.9rem;
+				white-space: nowrap;
+			}
+
+			@media (max-width: 720px) {
+				.featured-grid {
+					grid-template-columns: 1fr;
+				}
+				.hero h1 {
+					font-size: 2.1rem;
+				}
+				.recent-list a {
+					flex-direction: column;
+					gap: 0.2rem;
+				}
+			}
+		</style>
+	</head>
+	<body>
+		<Header />
+		<main>
+			<!-- Hero: positioning + resume/social links for recruiters -->
+			<section class="hero">
+				<h1>{SITE_TITLE}</h1>
+				<p class="tagline">{SITE_TAGLINE}</p>
+				<p class="intro">{SITE_DESCRIPTION}</p>
+				<div class="hero-links">
+					<a class="primary" href="/blog">Read the deep dives</a>
+					<a href={SOCIAL_LINKS.resume}>Résumé / About</a>
+					<a href={SOCIAL_LINKS.github} target="_blank" rel="noopener">GitHub</a>
+					<a href={SOCIAL_LINKS.linkedin} target="_blank" rel="noopener">LinkedIn</a>
+				</div>
+			</section>
+
+			<!-- Featured deep dives -->
+			{
+				featured.length > 0 && (
+					<section>
+						<div class="section-head">
+							<h2>Featured</h2>
+							<a href="/blog">All posts →</a>
+						</div>
+						<ul class="featured-grid">
+							{featured.map((post) => (
+								<li class="card">
+									<a href={`/blog/${post.id}/`}>
+										{post.data.heroImage && (
+											<Image
+												width={480}
+												height={270}
+												src={post.data.heroImage}
+												alt=""
+											/>
+										)}
+										<div class="card-body">
+											{post.data.tags.length > 0 && (
+												<div class="tags">
+													{post.data.tags.slice(0, 2).map((tag) => (
+														<span class="tag">{tag}</span>
+													))}
+												</div>
+											)}
+											<span class="card-title">{post.data.title}</span>
+											<p class="card-desc">{post.data.description}</p>
+										</div>
+									</a>
+								</li>
+							))}
+						</ul>
+					</section>
+				)
+			}
+
+			<!-- Recent posts -->
+			<section>
+				<div class="section-head">
+					<h2>Recent</h2>
+					<a href="/blog">All posts →</a>
+				</div>
+				<ul class="recent-list">
+					{
+						recent.map((post) => (
+							<li>
+								<a href={`/blog/${post.id}/`}>
+									<span class="r-title">{post.data.title}</span>
+									<span class="r-date">
+										<FormattedDate date={post.data.pubDate} />
+									</span>
+								</a>
+							</li>
+						))
+					}
+				</ul>
+			</section>
+		</main>
+		<Footer />
+	</body>
+</html>
