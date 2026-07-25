@@ -1,6 +1,8 @@
 ---
 import { Image } from 'astro:assets';
 import { getCollection } from 'astro:content';
+import bannerImage from '../assets/london-banner.jpeg';
+import profilePhoto from '../assets/profile-photo-1.jpeg';
 import BaseHead from '../components/BaseHead.astro';
 import Footer from '../components/Footer.astro';
 import FormattedDate from '../components/FormattedDate.astro';
@@ -33,9 +35,47 @@ const recent = posts.slice(0, 5);
 
 			/* Hero */
 			.hero {
-				padding: 2rem 0 3rem;
+				padding: 1.5rem 0 3rem;
 				border-bottom: 1px solid rgb(var(--gray-light));
 				margin-bottom: 3rem;
+			}
+
+			/* Full-bleed LinkedIn-style banner with overlapping avatar */
+			.banner-full {
+				position: relative;
+				width: 100%;
+			}
+			.banner-full .banner-img {
+				display: block;
+				width: 100%;
+				/* Image is already cropped to a banner strip; show it in full. */
+				height: auto;
+				border-radius: 0;
+			}
+			.banner-inner {
+				position: relative;
+				width: 960px;
+				max-width: calc(100% - 2em);
+				margin: 0 auto;
+			}
+			.banner-full .avatar {
+				position: absolute;
+				left: 0;
+				bottom: -105px;
+				width: 210px;
+				height: 210px;
+				border-radius: 50%;
+				object-fit: cover;
+				border: 6px solid #fff;
+				box-shadow: var(--box-shadow);
+				background: #fff;
+			}
+			/* Room for the avatar overlap below the banner + a gap before the name */
+			main {
+				padding-top: 8.5rem;
+			}
+			.hero {
+				padding-top: 0;
 			}
 			.hero h1 {
 				font-size: 2.8rem;
@@ -47,7 +87,7 @@ const recent = posts.slice(0, 5);
 				margin: 0 0 1rem;
 			}
 			.hero p.intro {
-				max-width: 46ch;
+				max-width: 55ch;
 				margin: 0 0 1.5rem;
 			}
 			.hero-links {
@@ -209,6 +249,15 @@ const recent = posts.slice(0, 5);
 				.featured-grid {
 					grid-template-columns: 1fr;
 				}
+				.banner-full .avatar {
+					width: 144px;
+					height: 144px;
+					bottom: -72px;
+					border-width: 5px;
+				}
+				main {
+					padding-top: 6.5rem;
+				}
 				.hero h1 {
 					font-size: 2.1rem;
 				}
@@ -221,6 +270,29 @@ const recent = posts.slice(0, 5);
 	</head>
 	<body>
 		<Header />
+		<!-- Full-bleed LinkedIn-style banner with overlapping avatar -->
+		<div class="banner-full">
+			<Image
+				class="banner-img"
+				src={bannerImage}
+				alt="London skyline with Tower Bridge"
+				width={2560}
+				height={656}
+				quality={90}
+				loading="eager"
+			/>
+			<div class="banner-inner">
+				<Image
+					class="avatar"
+					src={profilePhoto}
+					alt={SITE_TITLE}
+					width={480}
+					height={480}
+					quality={90}
+					loading="eager"
+				/>
+			</div>
+		</div>
 		<main>
 			<!-- Hero: positioning + resume/social links for recruiters -->
 			<section class="hero">
@@ -230,7 +302,7 @@ const recent = posts.slice(0, 5);
 				<div class="hero-links">
 					<a class="primary" href="/blog">Read the deep dives</a>
 					<a href="/about">About</a>
-					<a href={SOCIAL_LINKS.resume} target="_blank" rel="noopener">Résumé (PDF)</a>
+					<a href={SOCIAL_LINKS.resume} target="_blank" rel="noopener">Resume 📄</a>
 					<a href={SOCIAL_LINKS.github} target="_blank" rel="noopener">GitHub</a>
 					<a href={SOCIAL_LINKS.linkedin} target="_blank" rel="noopener">LinkedIn</a>
 				</div>

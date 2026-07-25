@@ -1,7 +1,7 @@
 ---
 import AboutHeroImage from '../assets/blog-placeholder-about.jpg';
 import Layout from '../layouts/BlogPost.astro';
-import { SOCIAL_LINKS } from '../consts';
+import { SITE_LOCATION, SOCIAL_LINKS } from '../consts';
 
 const stack = [
 	{
@@ -33,12 +33,31 @@ const stack = [
 	pubDate={new Date('July 25 2026')}
 	heroImage={AboutHeroImage}
 >
+	<p class="location">
+		<svg
+			class="pin"
+			viewBox="0 0 24 24"
+			width="18"
+			height="18"
+			aria-hidden="true"
+			fill="none"
+			stroke="currentColor"
+			stroke-width="2"
+			stroke-linecap="round"
+			stroke-linejoin="round"
+		>
+			<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+			<circle cx="12" cy="10" r="3"></circle>
+		</svg>
+		<span>Based in {SITE_LOCATION}</span>
+	</p>
+
 	<p>
-		I'm Raghav — a Software Development Engineer II at Amazon with four years of
-		experience building mobile products end-to-end, from Android client
-		architecture down to the distributed services and AWS infrastructure that
-		power them. I care about systems that stay correct and fast as they scale,
-		and about the design decisions that get them there.
+		I'm Raghav — a Software Development Engineer II at Amazon, based in {SITE_LOCATION},
+		with four years of experience building mobile products end-to-end, from
+		Android client architecture down to the distributed services and AWS
+		infrastructure that power them. I care about systems that stay correct and
+		fast as they scale, and about the design decisions that get them there.
 	</p>
 
 	<h2>What I work on</h2>
@@ -86,13 +105,30 @@ const stack = [
 	<h2>Get in touch</h2>
 	<ul class="contact">
 		<li><a href={SOCIAL_LINKS.email}>Email</a></li>
-		<li><a href={SOCIAL_LINKS.resume} target="_blank" rel="noopener">Résumé (PDF)</a></li>
+		<li><a href={SOCIAL_LINKS.resume} target="_blank" rel="noopener">Resume</a></li>
 		<li><a href={SOCIAL_LINKS.github} target="_blank" rel="noopener">GitHub</a></li>
 		<li><a href={SOCIAL_LINKS.linkedin} target="_blank" rel="noopener">LinkedIn</a></li>
 	</ul>
 </Layout>
 
 <style>
+	.location {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		margin: 0 0 1.5em;
+		padding: 0.35rem 0.9rem;
+		border-radius: 999px;
+		background: rgba(var(--gray-light), 0.6);
+		border: 1px solid rgb(var(--gray-light));
+		color: rgb(var(--gray-dark));
+		font-size: 0.95rem;
+		font-weight: 600;
+	}
+	.location .pin {
+		color: var(--accent);
+		flex-shrink: 0;
+	}
 	.stack {
 		margin: 0 0 2em;
 	}
