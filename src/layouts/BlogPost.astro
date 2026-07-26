@@ -8,10 +8,20 @@ import Header from '../components/Header.astro';
 
 type Props = CollectionEntry<'blog'>['data'] & {
 	related?: CollectionEntry<'blog'>[];
+	// Section this post belongs to, used to build tag/related links.
+	basePath?: string;
 };
 
-const { title, description, pubDate, updatedDate, heroImage, tags = [], related = [] } =
-	Astro.props;
+const {
+	title,
+	description,
+	pubDate,
+	updatedDate,
+	heroImage,
+	tags = [],
+	related = [],
+	basePath = '/blog',
+} = Astro.props;
 ---
 
 <html lang="en">
@@ -145,7 +155,7 @@ const { title, description, pubDate, updatedDate, heroImage, tags = [], related 
 							tags.length > 0 && (
 								<div class="post-tags">
 									{tags.map((tag) => (
-										<a href={`/blog/?tag=${encodeURIComponent(tag)}`}>{tag}</a>
+										<a href={`${basePath}/?tag=${encodeURIComponent(tag)}`}>{tag}</a>
 									))}
 								</div>
 							)
@@ -162,7 +172,7 @@ const { title, description, pubDate, updatedDate, heroImage, tags = [], related 
 						<ul>
 							{related.map((post) => (
 								<li>
-									<a href={`/blog/${post.id}/`}>
+									<a href={`${basePath}/${post.id}/`}>
 										<span>{post.data.title}</span>
 										<span class="r-date">
 											<FormattedDate date={post.data.pubDate} />

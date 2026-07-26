@@ -1,0 +1,219 @@
+---
+import { Image } from 'astro:assets';
+import { getCollection } from 'astro:content';
+import BaseHead from '../../components/BaseHead.astro';
+import Footer from '../../components/Footer.astro';
+import FormattedDate from '../../components/FormattedDate.astro';
+import Header from '../../components/Header.astro';
+import { SITE_TITLE } from '../../consts';
+
+const basePath = '/knowledge-base';
+const posts = (await getCollection('knowledgeBase')).sort(
+	(a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf(),
+);
+
+// Unique tag list for the filter bar, sorted alphabetically.
+const allTags = [
+	...new Set(posts.flatMap((post) => post.data.tags)),
+].sort((a, b) => a.localeCompare(b));
+---
+
+<!doctype html>
+<html lang="en">
+	<head>
+		<BaseHead
+			title={`Concepts & Notes · ${SITE_TITLE}`}
+			description="Concise, original reference notes covering core Computer Science fundamentals, System Design, and framework internals. Built as a living knowledge base for quick revision and deep technical clarity."
+		/>
+		<style>
+			main {
+				width: 960px;
+			}
+			.page-head {
+				margin-bottom: 1.5rem;
+			}
+			.page-head h1 {
+				font-size: 2.2rem;
+				margin-bottom: 0.25rem;
+			}
+			.page-head p {
+				color: rgb(var(--gray));
+				margin: 0;
+			}
+			.filter-bar {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.5rem;
+				margin-bottom: 2.5rem;
+			}
+			.filter-bar button {
+				font-family: inherit;
+				font-size: 0.85rem;
+				padding: 0.3rem 0.9rem;
+				border-radius: 999px;
+				border: 1px solid rgb(var(--gray-light));
+				background: transparent;
+				color: rgb(var(--gray-dark));
+				cursor: pointer;
+				transition: 0.15s ease;
+			}
+			.filter-bar button:hover {
+				border-color: var(--accent);
+				color: var(--accent);
+			}
+			.filter-bar button[aria-pressed='true'] {
+				background: var(--accent);
+				border-color: var(--accent);
+				color: #fff;
+			}
+			ul.posts {
+				display: grid;
+				grid-template-columns: repeat(2, 1fr);
+				gap: 2rem;
+				list-style: none;
+				margin: 0;
+				padding: 0;
+			}
+			ul.posts li a {
+				display: block;
+				text-decoration: none;
+				color: inherit;
+				transition: 0.2s ease;
+			}
+			ul.posts img {
+				margin-bottom: 0.6rem;
+				border-radius: 12px;
+				aspect-ratio: 16 / 9;
+				object-fit: cover;
+				width: 100%;
+			}
+			.title {
+				margin: 0;
+				color: rgb(var(--black));
+				line-height: 1.2;
+				font-size: 1.35rem;
+			}
+			.date {
+				margin: 0.25rem 0 0.5rem;
+				color: rgb(var(--gray));
+				font-size: 0.9rem;
+			}
+			.tags {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.4rem;
+				margin-top: 0.5rem;
+			}
+			.tag {
+				font-size: 0.72rem;
+				padding: 0.12rem 0.55rem;
+				border-radius: 999px;
+				background: rgb(var(--gray-light));
+				color: rgb(var(--gray-dark));
+			}
+			ul.posts li a:hover .title {
+				color: var(--accent);
+			}
+			ul.posts li a:hover img {
+				box-shadow: var(--box-shadow);
+			}
+			.empty {
+				color: rgb(var(--gray));
+				font-style: italic;
+			}
+			@media (max-width: 720px) {
+				ul.posts {
+					grid-template-columns: 1fr;
+				}
+			}
+		</style>
+	</head>
+	<body>
+		<Header />
+		<main>
+			<div class="page-head">
+				<h1>Concepts & Notes</h1>
+				<p>Concise, original reference notes covering core Computer Science fundamentals, System Design, and framework internals. Built as a living knowledge base for quick revision and deep technical clarity.</p>
+			</div>
+
+			{
+				allTags.length > 0 && (
+					<div class="filter-bar" role="group" aria-label="Filter notes by topic">
+						<button type="button" data-tag="*" aria-pressed="true">
+							All
+						</button>
+						{allTags.map((tag) => (
+							<button type="button" data-tag={tag} aria-pressed="false">
+								{tag}
+							</button>
+						))}
+					</div>
+				)
+			}
+
+			<section>
+				<ul class="posts">
+					{
+						posts.map((post) => (
+							<li class="post" data-tags={post.data.tags.join('|')}>
+								<a href={`${basePath}/${post.id}/`}>
+									{post.data.heroImage && (
+										<Image
+											width={480}
+											height={270}
+											src={post.data.heroImage}
+											alt=""
+										/>
+									)}
+									<h4 class="title">{post.data.title}</h4>
+									<p class="date">
+										<FormattedDate date={post.data.pubDate} />
+									</p>
+									{post.data.tags.length > 0 && (
+										<div class="tags">
+											{post.data.tags.map((tag) => (
+												<span class="tag">{tag}</span>
+											))}
+										</div>
+									)}
+								</a>
+							</li>
+						))
+					}
+				</ul>
+				{posts.length === 0 && <p class="empty">No entries yet — check back soon.</p>}
+				<p class="empty" hidden>No entries match that topic yet.</p>
+			</section>
+		</main>
+		<Footer />
+		<script>
+			const buttons =
+				document.querySelectorAll<HTMLButtonElement>('.filter-bar button');
+			const posts = document.querySelectorAll<HTMLLIElement>('.post');
+			const empty = document.querySelector<HTMLParagraphElement>('.empty[hidden]');
+
+			function applyFilter(tag: string) {
+				let visible = 0;
+				posts.forEach((post) => {
+					const tags = (post.dataset.tags || '').split('|');
+					const show = tag === '*' || tags.includes(tag);
+					post.hidden = !show;
+					if (show) visible++;
+				});
+				buttons.forEach((btn) =>
+					btn.setAttribute('aria-pressed', String(btn.dataset.tag === tag)),
+				);
+				if (empty) empty.hidden = visible !== 0;
+			}
+
+			buttons.forEach((btn) =>
+				btn.addEventListener('click', () => applyFilter(btn.dataset.tag || '*')),
+			);
+
+			const requested = new URLSearchParams(location.search).get('tag');
+			if (requested && [...buttons].some((b) => b.dataset.tag === requested)) {
+				applyFilter(requested);
+			}
+		</script>
+	</body>
+</html>

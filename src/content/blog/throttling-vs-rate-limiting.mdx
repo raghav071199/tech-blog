@@ -1,0 +1,16 @@
+---
+title: 'Throttling vs Rate Limiting: Two Answers to Too Much Traffic'
+description: 'They get used interchangeably, but they solve different problems. When to shed load, when to smooth it, and how the two compose into a resilient API.'
+pubDate: 'Jul 26 2026'
+heroImage: '../../assets/api-rate-limit.png'
+tags: ['System Design', 'Backend']
+featured: false
+---
+
+*Draft in progress.*
+
+Throttling and rate limiting are often used as synonyms, but they answer
+different questions: rate limiting decides *whether* a request is allowed in a
+window, while throttling decides *how fast* work is allowed to proceed. This post
+will build toward when to reach for each — and how they compose into a resilient
+API — rather than declaring a winner up front.

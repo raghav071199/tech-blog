@@ -1,0 +1,39 @@
+---
+import { type CollectionEntry, getCollection, render } from 'astro:content';
+import BlogPost from '../../layouts/BlogPost.astro';
+
+export async function getStaticPaths() {
+	const posts = await getCollection('knowledgeBase');
+	return posts.map((post) => ({
+		params: { slug: post.id },
+		props: { post, posts },
+	}));
+}
+type Props = {
+	post: CollectionEntry<'knowledgeBase'>;
+	posts: CollectionEntry<'knowledgeBase'>[];
+};
+
+const { post, posts } = Astro.props;
+const { Content } = await render(post);
+
+// Related entries: share at least one tag, ranked by shared count then recency.
+const related = posts
+	.filter((p) => p.id !== post.id)
+	.map((p) => ({
+		post: p,
+		shared: p.data.tags.filter((t) => post.data.tags.includes(t)).length,
+	}))
+	.filter((r) => r.shared > 0)
+	.sort(
+		(a, b) =>
+			b.shared - a.shared ||
+			b.post.data.pubDate.valueOf() - a.post.data.pubDate.valueOf(),
+	)
+	.slice(0, 3)
+	.map((r) => r.post);
+---
+
+<BlogPost {...post.data} related={related} basePath="/knowledge-base">
+	<Content />
+</BlogPost>
