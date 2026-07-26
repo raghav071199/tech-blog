@@ -1,0 +1,14 @@
+---
+title: 'Fixing ANRs in Android Applications'
+description: 'What actually triggers an "Application Not Responding" dialog, how to read the trace, and the patterns that keep the main thread free.'
+pubDate: 'Jul 26 2026'
+heroImage: '../../assets/anr.jpg'
+tags: ['Android']
+featured: false
+---
+
+*Draft in progress.*
+
+A deep dive into ANRs — what trips the main-thread watchdog, how to read an ANR
+trace and pinpoint the blocking call, and the concrete patterns (offloading work,
+StrictMode, frame budgets) that keep the UI thread responsive under load.

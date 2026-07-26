@@ -1,0 +1,14 @@
+---
+title: 'How Connection Pooling Fixes Network Latency in Android Applications'
+description: 'Why opening a fresh socket per request is slow, how connection pooling reuses TCP/TLS connections, and how OkHttp puts it to work on Android.'
+pubDate: 'Jul 26 2026'
+tags: ['Android', 'System Design']
+featured: false
+---
+
+*Draft in progress.*
+
+Why a new connection per request is expensive (TCP handshake plus TLS
+negotiation on every call), how connection pooling amortizes that cost by reusing
+warm connections, and how OkHttp's pool, keep-alive, and HTTP/2 multiplexing cut
+tail latency in real Android apps.
