@@ -1,16 +1,202 @@
 ---
 title: 'Dependency Injection in Spring Boot: Why Constructor Injection Won'
-description: 'The run-time half of the dependency story: how Spring wires your objects together, and why constructor injection beat field and setter injection.'
+description: 'The run-time half of the dependency story. Start with a class that news up its own collaborators, watch it become untestable and rigid, and let constructor injection earn its place over the field injection everyone reaches for first.'
 pubDate: 'Jul 26 2026'
 heroImage: '../../assets/dependency-injection.svg'
 tags: ['Backend', 'System Design']
 featured: false
 ---
 
-It's the run-time companion to
-[Dependency Management in Spring Boot Microservices](/blog/dependency-management-spring-boot-microservices/) —
-where that post covered how you *declare and version* your libraries at build
-time, this one covers how Spring *wires your objects together* at run time, and
-why constructor injection won out over field and setter injection.
+import Aside from '../../components/Aside.astro';
+import Mermaid from '../../components/Mermaid.astro';
 
-Check back shortly.
+This is the run-time companion to
+[Dependency Management in Spring Boot Microservices](/blog/dependency-management-spring-boot-microservices/) —
+that post covered how you *declare and version* libraries at build time; this one
+covers how Spring *wires your objects together* at run time. We'll start with a
+class that builds its own collaborators, feel why that doesn't scale, and let
+constructor injection earn its place — including over the field injection most
+tutorials reach for first.
+
+## The problem: a class that builds its own dependencies
+
+Here's an `OrderService` that does the obvious thing — it creates what it needs:
+
+```java
+public class OrderService {
+    private final PaymentClient paymentClient;
+    private final InventoryRepository inventory;
+
+    public OrderService() {
+        // hard-wired: this class decides how its collaborators are built
+        this.paymentClient = new PaymentClient("https://payments.prod/api", 3000);
+        this.inventory = new InventoryRepository(new PostgresConnection("prod-db"));
+    }
+
+    public void placeOrder(Order order) { /* ... */ }
+}
+```
+
+It compiles, it runs, and it looks harmless. The rot is structural, and it shows
+up the moment the class has to live in more than one context.
+
+**It can't be tested in isolation.** To unit-test `placeOrder`, you'd want a fake
+`PaymentClient` that doesn't hit the network. You can't hand one in — the
+constructor hard-codes a real one pointed at *production*. Your "unit" test now
+needs a live payments endpoint and a Postgres box.
+
+**It hard-codes environment.** The prod URL and DB host are baked into the class.
+Staging, local, and test all need different values, so you end up threading
+`if (env == ...)` branches through code that should not know what an environment is.
+
+**It doesn't scale past a toy graph.** `PaymentClient` needs config; the
+repository needs a connection, which needs a pool, which needs credentials. Every
+object constructing its own dependencies means that whole tree gets rebuilt, by
+hand, at every call site — and rebuilt *differently* each time someone forgets a
+setting.
+
+<Mermaid chart={`
+graph TD
+    O[OrderService] -->|new| P[PaymentClient]
+    O -->|new| R[InventoryRepository]
+    R -->|new| C[PostgresConnection]
+    P -->|new| CFG[hard-coded URL + timeout]
+    C -->|new| CRED[hard-coded host + creds]
+    style O fill:#ffd9d9,stroke:#c00
+`} />
+
+The root cause has a name: the class controls *both* its business logic **and**
+the construction of everything it depends on. Those are two jobs, and the second
+one shouldn't be its.
+
+## Inverting control
+
+The fix is to stop having the object build its collaborators and instead have them
+**handed in** from outside. That inversion — the object no longer controls how its
+dependencies come to exist — is **Inversion of Control (IoC)**, and *dependency
+injection* is how you implement it.
+
+In Spring, a container (the **application context**) owns that job. You declare
+what each collaborator *is* once, and the container constructs the graph and
+passes each object what it needs.
+
+<Aside title="Bean, quickly">
+A **bean** is just an object whose lifecycle Spring manages — it creates it, wires
+its dependencies, and hands it out wherever that type is needed. You mark a class
+with `@Component` (or `@Service`, `@Repository`, `@Configuration`-provided
+`@Bean`s) and it becomes a candidate for injection.
+</Aside>
+
+<Mermaid chart={`
+graph TD
+    CTX[Spring ApplicationContext] -->|constructs & injects| O[OrderService]
+    CTX -->|constructs| P[PaymentClient]
+    CTX -->|constructs| R[InventoryRepository]
+    P -.->|injected into| O
+    R -.->|injected into| O
+    style CTX fill:#d9e8ff,stroke:#369,stroke-width:2px
+    style O fill:#d9ffe0,stroke:#3a3
+`} />
+
+But *how* the container injects matters. There are three ways, and they are not
+equivalent.
+
+## The tempting-but-flawed version: field injection
+
+This is the one most examples show, because it's the shortest:
+
+```java
+@Service
+public class OrderService {
+    @Autowired private PaymentClient paymentClient;
+    @Autowired private InventoryRepository inventory;
+
+    public void placeOrder(Order order) { /* ... */ }
+}
+```
+
+No constructor, no boilerplate — Spring reflectively sets the fields after
+constructing the object. It looks like a clean win. It isn't, for reasons that
+only surface later:
+
+- **You still can't build it without Spring.** In a plain unit test, `new
+  OrderService()` gives you an object with `null` fields — the `@Autowired` only
+  works inside the container. So you're forced into reflection or a full Spring
+  context just to test one method.
+- **The fields can't be `final`.** They're set after construction, so the object
+  is mutable and its dependencies can be swapped or left null. You lose the
+  compiler's guarantee that a fully-built `OrderService` *has* its collaborators.
+- **Dependencies are hidden.** The only way to know what this class needs is to
+  grep for `@Autowired`. A constructor puts that list in the class's public
+  signature, where callers and readers can see it.
+- **It hides "too many dependencies."** Because adding one is just one more
+  annotated field, a class can quietly grow ten of them. A constructor with ten
+  parameters *looks* wrong — and that visible discomfort is a useful design signal.
+
+<Aside title="Setter injection">
+Setter injection (an `@Autowired` setter per dependency) shares field injection's
+core problems — no `final`, dependencies optional and mutable — while adding
+boilerplate. Its one niche is genuinely optional or reconfigurable dependencies;
+for required collaborators it's the worst of both worlds.
+</Aside>
+
+## The solution: constructor injection
+
+Ask for the dependencies in the constructor. Spring sees the parameters and
+supplies the matching beans:
+
+```java
+@Service
+public class OrderService {
+    private final PaymentClient paymentClient;
+    private final InventoryRepository inventory;
+
+    // No @Autowired needed — a single constructor is autowired by default
+    public OrderService(PaymentClient paymentClient, InventoryRepository inventory) {
+        this.paymentClient = paymentClient;
+        this.inventory = inventory;
+    }
+
+    public void placeOrder(Order order) { /* ... */ }
+}
+```
+
+Every problem above dissolves — not by convention, but by construction:
+
+1. **Testable with plain Java.** `new OrderService(fakePayment, fakeInventory)` —
+   no container, no reflection. The class is trivially unit-testable because you
+   control exactly what goes in.
+2. **Genuinely immutable.** The fields are `final` and set once at construction.
+   A constructed `OrderService` is guaranteed to have its collaborators, and no
+   code can swap them out later.
+3. **Dependencies are explicit.** The constructor *is* the list of what this class
+   needs. It can't hide a dependency, and a bloated constructor honestly signals a
+   class doing too much.
+4. **Fail-fast, at startup.** If a required bean is missing, the context fails to
+   start — you find out at boot, not on the first production request. And an
+   unbreakable circular dependency (`A` needs `B` needs `A`) surfaces immediately
+   instead of being silently tolerated the way field injection allows.
+
+<Aside>
+With a single constructor you don't even need `@Autowired` — Spring wires it
+automatically. Pair this with Lombok's `@RequiredArgsConstructor` (which generates
+the constructor from your `final` fields) and constructor injection has *less*
+boilerplate than the `@Autowired` fields it replaces.
+</Aside>
+
+## Takeaways
+
+| Concern | Field / setter injection | Constructor injection |
+| --- | --- | --- |
+| Unit test without Spring | Needs reflection or a context | `new` it with fakes |
+| Immutable (`final`) fields | No | Yes |
+| Dependencies visible | Hidden in annotations | In the constructor signature |
+| Missing bean detected | Sometimes at runtime | At startup |
+| "Too many deps" signal | Hidden | A fat constructor is obvious |
+
+The deeper point isn't "annotate differently." It's that a class shouldn't be in
+charge of building the things it depends on — that's the one job you hand to the
+container. Once construction moves out, constructor injection is simply the option
+that makes the result immutable, explicit, and testable with nothing but `new`.
+Reach for it by default; drop to setter injection only for the rare dependency
+that's truly optional.

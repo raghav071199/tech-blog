@@ -10,6 +10,12 @@ type Props = CollectionEntry<'blog'>['data'] & {
 	related?: CollectionEntry<'blog'>[];
 	// Section this post belongs to, used to build tag/related links.
 	basePath?: string;
+	// Render the hero image full-viewport-width, uncropped (no crop/shadow).
+	heroFullBleed?: boolean;
+	// Show the published/updated date block (hidden on static pages like About).
+	showDate?: boolean;
+	// Show the visible <h1> title (page <title> is kept regardless).
+	showHeading?: boolean;
 };
 
 const {
@@ -21,6 +27,9 @@ const {
 	tags = [],
 	related = [],
 	basePath = '/blog',
+	heroFullBleed = false,
+	showDate = true,
+	showHeading = true,
 } = Astro.props;
 ---
 
@@ -41,6 +50,18 @@ const {
 				margin: 0 auto;
 				border-radius: 12px;
 				box-shadow: var(--box-shadow);
+			}
+			/* Full-bleed hero: span the whole viewport, show the image uncropped. */
+			.hero-image.full-bleed {
+				width: 100vw;
+				margin-left: 50%;
+				transform: translateX(-50%);
+			}
+			.hero-image.full-bleed img {
+				width: 100%;
+				height: auto;
+				border-radius: 0;
+				box-shadow: none;
 			}
 			.prose {
 				width: 720px;
@@ -135,22 +156,31 @@ const {
 		<Header />
 		<main>
 			<article>
-				<div class="hero-image">
-					{heroImage && <Image width={1020} height={510} src={heroImage} alt="" />}
+				<div class:list={['hero-image', { 'full-bleed': heroFullBleed }]}>
+					{
+						heroImage &&
+							(heroFullBleed ? (
+								<Image src={heroImage} alt="" />
+							) : (
+								<Image width={1020} height={510} src={heroImage} alt="" />
+							))
+					}
 				</div>
 				<div class="prose">
 					<div class="title">
-						<div class="date">
-							<FormattedDate date={pubDate} />
-							{
-								updatedDate && (
-									<div class="last-updated-on">
-										Last updated on <FormattedDate date={updatedDate} />
-									</div>
-								)
-							}
-						</div>
-						<h1>{title}</h1>
+						{
+							showDate && (
+								<div class="date">
+									<FormattedDate date={pubDate} />
+									{updatedDate && (
+										<div class="last-updated-on">
+											Last updated on <FormattedDate date={updatedDate} />
+										</div>
+									)}
+								</div>
+							)
+						}
+						{showHeading && <h1>{title}</h1>}
 						{
 							tags.length > 0 && (
 								<div class="post-tags">
@@ -160,7 +190,7 @@ const {
 								</div>
 							)
 						}
-						<hr />
+						{showHeading && <hr />}
 					</div>
 					<slot />
 				</div>

@@ -1,5 +1,5 @@
 ---
-import AboutHeroImage from '../assets/blog-placeholder-about.jpg';
+import AboutHeroImage from '../assets/about-me.png';
 import Layout from '../layouts/BlogPost.astro';
 import { SITE_LOCATION, SOCIAL_LINKS } from '../consts';
 
@@ -32,6 +32,9 @@ const stack = [
 	description="SDE II at Amazon with 4 years building Android apps and the distributed systems behind them."
 	pubDate={new Date('July 25 2026')}
 	heroImage={AboutHeroImage}
+	heroFullBleed={true}
+	showDate={false}
+	showHeading={false}
 >
 	<p class="location">
 		<svg
