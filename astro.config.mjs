@@ -3,11 +3,13 @@
 import mdx from '@astrojs/mdx';
 import sitemap from '@astrojs/sitemap';
 import { defineConfig, fontProviders } from 'astro/config';
+import mermaid from 'astro-mermaid';
 
 // https://astro.build/config
 export default defineConfig({
 	site: 'https://example.com',
-	integrations: [mdx(), sitemap()],
+	// astro-mermaid must run before mdx() so it can transform ```mermaid blocks.
+	integrations: [mermaid({ theme: 'neutral' }), mdx(), sitemap()],
 	fonts: [
 		{
 			provider: fontProviders.local(),

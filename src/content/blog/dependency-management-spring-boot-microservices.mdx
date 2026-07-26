@@ -1,0 +1,363 @@
+---
+title: 'Dependency Management in Spring Boot Microservices'
+description: 'Log4Shell dropped on a Friday and every Java team on earth had to find out where they were exposed. Good dependency management was never a shield — it decided your blast radius. From hand-pinned versions to a governed BOM, and the trade-offs at every step.'
+pubDate: 'Jul 26 2026'
+heroImage: '../../assets/dependency-hell.jpg'
+tags: ['Microservices', 'System Design', 'Backend']
+featured: true
+---
+
+import Aside from '../../components/Aside.astro';
+import Mermaid from '../../components/Mermaid.astro';
+
+## The Friday afternoon that started it
+
+You don't have to imagine this one — it happened, at global scale. On the evening
+of **9 December 2021**, a critical vulnerability in **Log4j** — a logging library
+so common it was running in a staggering share of the world's Java software — went
+public. It scored the maximum severity and shipped with a patch-immediately
+advisory, and it came to be known as **Log4Shell**.
+
+<Aside title="CVE and CVSS, quickly">
+Log4Shell's formal ID is **`CVE-2021-44228`**. A **CVE** (Common Vulnerabilities
+and Exposures) is a publicly catalogued security flaw, each with a unique ID like
+that one. **CVSS** (Common Vulnerability Scoring System) is the 0–10 severity
+score attached to it; Log4Shell earned the maximum **10.0** —
+drop-everything-and-patch territory.
+</Aside>
+
+For engineering teams everywhere, that Friday evening became a scramble around one
+deceptively simple question. Picture a representative team — call it **Project
+Atlas**, running **14 Spring Boot microservices**: an orders service, payments,
+inventory, notifications, a handful of back-office tools, and a couple of shared
+internal libraries everyone depends on. For Atlas, the question that decided
+whether anyone went home that weekend was:
+
+> Which of our 14 services are affected, what version of Log4j is each one
+> actually running, and how many `pom.xml` files do we have to touch to fix it?
+
+Nobody could answer confidently. Some services had opted into Log4j explicitly.
+Most had never mentioned it at all — it rode in *transitively*, pulled by other
+libraries, at whatever version Maven happened to resolve. Two services were
+several minor versions apart for no reason anyone remembered. What should have
+been a ten-minute version bump became a weekend of `mvn dependency:tree`,
+spreadsheets, and cross-team Slack messages.
+
+That weekend is what this post is about. Not Log4Shell itself — the **dependency
+management strategy** that separates the teams who patched it in an afternoon from
+the teams who spent a weekend just figuring out where they were exposed. We'll
+start where Atlas started, feel each pain point, and let the better design *earn
+its place* rather than declaring it up front.
+
+<Aside title="One thing up front: this is not a security shield">
+It's tempting to conclude "good dependency management would have kept us safe from
+Log4Shell." It wouldn't have. The flaw was in the *library* — if a vulnerable
+version was on your classpath, you were exposed no matter how tidy your POMs were.
+What dependency management actually governs is everything that happens *after* the
+advisory drops: **how fast can you tell which services are affected, and how few
+places do you have to change to fix all of them?** That's the real payoff we're
+building toward — not immunity, but a small, knowable blast radius.
+</Aside>
+
+## First, a disambiguation
+
+The word "dependency" is overloaded in the Spring world, and conflating the two
+meanings is one of the most common sources of confusion I see:
+
+- **Dependency *management*** (this post) is a **build-time** concern: how you
+  *declare, version, and resolve* the third-party libraries your service pulls
+  in. This is Maven, Gradle, starters, and BOMs.
+- **Dependency *injection*** is a **run-time** concern: how the Spring container
+  *wires your objects together* — the Inversion of Control pattern, `@Component`,
+  constructor injection, and friends.
+
+They share a name and a loose principle ("don't hard-code your dependencies —
+declare them and let a system resolve them"), but they operate at completely
+different layers.
+
+<Aside>
+Dependency injection gets its own deep dive in a follow-up post:
+[**Dependency Injection in Spring Boot: Why Constructor Injection Won**](/blog/dependency-injection-spring-boot-constructor-injection/).
+Here we stay strictly at build time.
+</Aside>
+
+With that cleared up, let's look at how Atlas managed its build-time dependencies —
+starting from the bottom.
+
+## Baseline: every service for itself
+
+In the beginning, each service declared its dependencies with explicit versions,
+copy-pasted from whatever tutorial or sibling service was handy:
+
+```xml
+<!-- orders-service/pom.xml — the naive baseline -->
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+    <version>3.2.1</version>
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+    <version>3.2.1</version>
+  </dependency>
+  <dependency>
+    <groupId>com.fasterxml.jackson.core</groupId>
+    <artifactId>jackson-databind</artifactId>
+    <version>2.15.3</version>
+  </dependency>
+</dependencies>
+```
+
+This works — until it doesn't. Two problems show up fast.
+
+**Problem 1: transitive conflicts.** You didn't ask for `jackson-databind`
+directly at all in most cases; `spring-boot-starter-web` pulls it in. When you
+*also* pin it yourself at a different version, Maven's "nearest wins" resolution
+picks one, and it may not be the one either dependency was tested against.
+
+<Mermaid chart={`
+graph TD
+    A[orders-service] --> B[spring-boot-starter-web 3.2.1]
+    A --> C["jackson-databind 2.15.3 (explicit)"]
+    B --> D[jackson-databind 2.16.1]
+    C -.->|"nearest wins:<br/>2.15.3 selected"| E{Resolved: 2.15.3}
+    D -.->|overridden| E
+    style E fill:#ffd9d9,stroke:#c00
+`} />
+
+The subtle danger: Spring Boot 3.2.1 was integration-tested against Jackson
+2.16.1, but your explicit pin silently downgrades it to 2.15.3. Everything
+compiles. Everything even runs — until some serialization edge case behaves
+differently in production.
+
+**Problem 2: version drift.** Multiply the POM above across 14 services, each
+edited by different people at different times, and you get exactly the situation
+that made Log4Shell Friday so painful: no single source of truth for "what version
+of X are we on."
+
+The root cause is that **each service is independently deciding versions**, and
+nothing is coordinating them.
+
+## Option A: let the starter parent manage versions
+
+Spring Boot's first answer to this is the **`spring-boot-starter-parent`**. You
+inherit from it, and it brings a curated, mutually-compatible set of dependency
+versions with it:
+
+```xml
+<!-- orders-service/pom.xml — inheriting the Spring Boot parent -->
+<parent>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-parent</artifactId>
+  <version>3.2.1</version>
+  <relativePath/>
+</parent>
+
+<dependencies>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+    <!-- no version — managed by the parent -->
+  </dependency>
+  <dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+    <!-- no version — managed by the parent -->
+  </dependency>
+</dependencies>
+```
+
+Notice what disappeared: **the version numbers**. The parent's
+`<dependencyManagement>` section declares them, so every dependency Spring knows
+about is pinned to a version that was tested to work with all the others. Bumping
+Spring Boot is now a *one-line* change to the parent version, and Jackson, Tomcat,
+Hibernate, and hundreds of others move in lockstep.
+
+This is a genuine leap. Transitive conflicts largely vanish because the whole
+tree is governed by one curated version set. So why not stop here?
+
+**The catch: you only get one parent.** Maven inheritance is single-parent. In a
+real organization, Atlas wants its *own* parent POM too — for shared build plugin
+config, common internal dependencies, standardized Java version, and so on. The
+moment you write:
+
+```xml
+<parent>
+  <groupId>com.atlas.platform</groupId>
+  <artifactId>atlas-parent</artifactId>
+  <version>5.4.0</version>
+</parent>
+```
+
+…you've spent your one inheritance slot, and you can no longer *inherit* from
+`spring-boot-starter-parent`. You need a way to get Spring Boot's managed
+versions **without** using up the parent slot.
+
+## Option B: import the BOM instead of inheriting it
+
+This is where the **BOM — Bill of Materials** — enters. A BOM is a POM whose only
+job is to declare managed dependency versions. Crucially, you can **import** one
+into your `<dependencyManagement>` section without inheriting from it:
+
+```xml
+<!-- orders-service/pom.xml — company parent + imported Spring Boot BOM -->
+<parent>
+  <groupId>com.atlas.platform</groupId>
+  <artifactId>atlas-parent</artifactId>
+  <version>5.4.0</version>
+</parent>
+
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-dependencies</artifactId>
+      <version>3.2.1</version>
+      <type>pom</type>
+      <scope>import</scope>   <!-- the magic: import, not inherit -->
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+`spring-boot-dependencies` is the BOM that the starter-parent uses under the
+hood. By importing it with `<scope>import</scope>`, we get all of Spring Boot's
+curated versions **and** keep our single inheritance slot free for the company
+parent. Inheritance and BOM import compose where two parents never could.
+
+<Mermaid chart={`
+graph LR
+    subgraph Inheritance["Single inheritance slot"]
+        S[orders-service] -->|extends| P[atlas-parent]
+    end
+    subgraph Import["Composable imports"]
+        S -.->|imports BOM| SB[spring-boot-dependencies]
+        S -.->|imports BOM| ATLAS[atlas-platform-bom]
+    end
+    style P fill:#d9e8ff,stroke:#369
+    style SB fill:#d9ffe0,stroke:#3a3
+    style ATLAS fill:#d9ffe0,stroke:#3a3
+`} />
+
+This is the mechanism that unlocks everything else. Now let's zoom out from one
+service to fourteen — because that's where the real design decisions live.
+
+## Scaling to 14 services: the governance problem
+
+A BOM import fixes version chaos *within* a service. But Atlas's Friday-afternoon
+pain was *across* services. Two more issues emerge at fleet scale.
+
+**Version drift across services.** Even with each service importing the Spring
+Boot BOM, nothing stops orders-service from importing version `3.2.1` while
+payments imports `3.1.4`. Multiply across 14 services and you're back to "what
+version are we actually on?" — just one level up.
+
+**Shared internal libraries.** Atlas has a couple of libraries every service
+depends on: `atlas-common` (shared DTOs, error handling) and `atlas-security`
+(auth filters). These have their *own* versions, and their own transitive
+dependencies, which can conflict with the Spring-managed ones.
+
+The pattern that addresses both is a **company platform BOM** — an internally
+published BOM that itself imports the Spring Boot BOM, adds Atlas's internal
+library versions, and pins any deliberate overrides. Every service imports *one*
+thing:
+
+```xml
+<dependencyManagement>
+  <dependencies>
+    <dependency>
+      <groupId>com.atlas.platform</groupId>
+      <artifactId>atlas-platform-bom</artifactId>
+      <version>2026.1.0</version>
+      <type>pom</type>
+      <scope>import</scope>
+    </dependency>
+  </dependencies>
+</dependencyManagement>
+```
+
+<Mermaid chart={`
+graph TD
+    SBOM[spring-boot-dependencies BOM] --> PBOM[atlas-platform-bom 2026.1.0]
+    COMMON[atlas-common 4.2.0] --> PBOM
+    SEC[atlas-security 2.8.1] --> PBOM
+    PBOM --> S1[orders-service]
+    PBOM --> S2[payments-service]
+    PBOM --> S3[inventory-service]
+    PBOM --> S4[notifications-service]
+    PBOM --> S5[... 10 more services]
+    style PBOM fill:#d9e8ff,stroke:#369,stroke-width:2px
+    style SBOM fill:#d9ffe0,stroke:#3a3
+`} />
+
+Now rewind to that Log4Shell Friday. With a platform BOM in place, the answer to
+"how many files do we touch?" becomes: **one.** Bump the Log4j version in
+`atlas-platform-bom`, publish `2026.1.1`, and each service picks it up on its
+next build with a single-line version bump — or automatically, if you let a bot
+raise those PRs. The spreadsheet is gone.
+
+## The trade-off nobody tells you about
+
+Here's where I want to resist the urge to declare "company BOM = best practice"
+and walk away. Centralized governance has a real cost, and pretending otherwise
+is how you build a platform team that everyone routes around.
+
+<Aside>
+**Centralized governance vs. per-service autonomy** is the actual decision. A
+platform BOM optimizes for *consistency and fleet-wide patching*. It taxes
+*autonomy*: a service that legitimately needs a newer library than the BOM allows
+now has to either override locally (and document why) or wait for the platform
+team to bump it.
+</Aside>
+
+The healthy version of this pattern keeps three things true:
+
+1. **Overrides are allowed and cheap.** A service can pin a newer version in its
+   own `<dependencyManagement>` when it has a real reason — the BOM sets the
+   *default*, not a prison.
+2. **The BOM is versioned and released like a product,** on a predictable
+   cadence, with a changelog. A calendar-versioned scheme like `2026.1.0` makes
+   "how stale is this service?" answerable at a glance.
+3. **Bumping is automated.** A dependency bot raising per-service PRs against new
+   BOM releases is what turns the *mechanism* into an actual *reduction in toil*.
+
+Skip these and the BOM becomes a bottleneck: teams pin around it, drift returns,
+and you've added ceremony without the payoff.
+
+## When this is overkill
+
+Two microservices and a shared library? You almost certainly don't need a
+platform BOM. Inherit `spring-boot-starter-parent` directly (Option A), or import
+the Spring Boot BOM if you already have a company parent (Option B), and move on.
+The governance layer earns its keep somewhere around the point where "how many
+services are on the old version?" stops being a question you can answer from
+memory — for us, that was well before 14.
+
+## Takeaways
+
+A decision checklist, from least to most machinery — pick the lowest tier that
+solves your actual problem:
+
+| If you… | Use |
+| --- | --- |
+| Have one service, no company-wide build config | `spring-boot-starter-parent` (inherit) |
+| Need a company parent POM too | Import the `spring-boot-dependencies` BOM |
+| Run many services + shared internal libraries | Publish a company **platform BOM** that imports Spring Boot's |
+| Want fleet-wide patching to be a non-event | Platform BOM **+ automated dependency PRs + a release cadence** |
+
+The mechanism (BOMs) is easy. The design judgment is knowing **how much
+governance your fleet actually needs**, and being honest that every layer of
+centralization you add trades some team autonomy for fleet-wide consistency. And
+none of it makes you immune to the next Log4Shell — the flaw will still land on
+your classpath. What it buys you is the thing that actually mattered that Friday:
+the ability to answer *"where are we exposed?"* in minutes, and to fix it in one
+place instead of fourteen. That's not a heroic weekend — it's a small, knowable
+blast radius, and it's a version strategy worth growing into one service before
+you think you need it.
+
+---
+
+*Next up: the run-time half of the story —* [**Dependency Injection in Spring
+Boot: Why Constructor Injection Won**](/blog/dependency-injection-spring-boot-constructor-injection/).*

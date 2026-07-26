@@ -1,0 +1,21 @@
+---
+// Renders a real <pre class="mermaid"> element for use inside MDX.
+//
+// astro-mermaid's ```mermaid fence transform emits a raw-HTML node, which MDX
+// escapes into literal text (so nothing renders). A component sidesteps that:
+// MDX renders it as a real DOM element, and astro-mermaid's injected client
+// script (which scans for `pre.mermaid`) picks it up and draws the SVG.
+//
+// Pass the diagram source as the `chart` prop, as a raw template string:
+//   <Mermaid chart={`graph TD; A-->B`} />
+//
+// `set:text` escapes the source exactly once for the HTML source, so the
+// element's textContent — which mermaid.js reads — decodes back to the
+// original diagram definition.
+interface Props {
+	chart: string;
+}
+const { chart } = Astro.props;
+---
+
+<pre class="mermaid" set:text={chart.trim()}></pre>
