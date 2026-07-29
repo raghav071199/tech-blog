@@ -1,0 +1,169 @@
+---
+title: 'Distributed Consistency in Databases'
+description: 'What you actually give up when data lives on more than one node — the CAP theorem stated correctly, the PACELC latency half it omits, and the consistency models between "strong" and "eventual".'
+pubDate: 'Jul 29 2026'
+updatedDate: 'Jul 29 2026'
+tags: ['Databases', 'System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+[ACID](/knowledge-base/database-transactions-acid/) describes the guarantees of a
+*single* database. The moment your data lives on more than one node — replicas,
+shards, a cluster spanning regions — a new constraint takes over: the **CAP
+theorem**. This note covers what CAP actually says (it's routinely misquoted), the
+latency trade-off it leaves out (**PACELC**), and the consistency models that live
+between "strong" and "eventual."
+
+## The three properties
+
+CAP is about three properties of a distributed data store:
+
+- **Consistency** — every read sees the most recent write. All nodes agree on the
+  current value. (Note: this is *not* the C in ACID — here it means all replicas
+  return the same, latest data.)
+- **Availability** — every request gets a non-error response, even if it might be
+  stale.
+- **Partition tolerance** — the system keeps working when the network drops or
+  delays messages *between* nodes.
+
+<Aside title="The C in CAP ≠ the C in ACID">
+Same word, different meaning. [ACID's Consistency](/knowledge-base/database-transactions-acid/#consistency)
+is about a single node honoring its constraints. CAP's Consistency is about
+*multiple* nodes agreeing on the latest value — closer to ACID's *isolation*, at
+the level of "which write do you see." Conflating them is the most common CAP
+confusion.
+</Aside>
+
+## What CAP actually says
+
+The popular phrasing — "pick 2 of 3" — is misleading. In any real distributed
+system, network partitions **will** happen; they're a fact of networks, not a
+design option you can decline. So partition tolerance isn't really on the menu.
+
+The theorem is better stated as:
+
+> **When a network partition occurs, you must choose between Consistency and
+> Availability.** You cannot have both.
+
+That's the whole trade-off. During a partition, a node that can't reach its peers
+faces a binary choice: refuse the request to avoid serving stale or conflicting
+data (**choose C**), or answer anyway from what it has (**choose A**).
+
+```text
+Partition: node A and node B can't talk. A write hits A.
+A read hits B.
+
+  CP  → B refuses / errors the read   (won't risk stale data)
+  AP  → B answers with its old value  (stays up, may be stale)
+```
+
+<Aside title="There is no CA">
+"CA" is a category error, not a valid choice. If the network never partitioned you
+could have both C and A — but networks partition, so a system that hasn't chosen
+what to do during a partition simply hasn't been designed for reality. Every real
+distributed store is either CP or AP.
+</Aside>
+
+## CP vs AP in practice
+
+The choice maps to what your data can't tolerate:
+
+- **CP — sacrifice availability for correctness.** During a partition, reject
+  requests rather than serve wrong data. Right when stale reads are unacceptable:
+  account balances, inventory counts, distributed locks. Examples: etcd,
+  ZooKeeper, HBase, and (by config) most consensus-based stores.
+- **AP — sacrifice consistency for uptime.** During a partition, keep answering and
+  reconcile later. Right when being down is worse than being briefly stale: shopping
+  carts, social feeds, DNS, telemetry. Examples: Cassandra, DynamoDB (in its
+  default mode), Riak.
+
+<Aside>
+This is a *per-operation* dial more than a fixed product label. Cassandra and
+DynamoDB let you request stronger consistency on a specific read/write (quorum,
+`ConsistentRead`); a normally-CP store may allow stale reads from a follower. Judge
+the operation, not just the database's reputation.
+</Aside>
+
+## PACELC: the half CAP leaves out
+
+CAP only describes behavior *during* a partition — which is rare. It says nothing
+about the trade-off the other 99% of the time. **PACELC** completes it:
+
+> **If** there's a **P**artition, trade between **A**vailability and **C**onsistency;
+> **E**lse (normal operation), trade between **L**atency and **C**onsistency.
+
+The key insight is the "else": even with a healthy network, keeping replicas
+strongly consistent costs latency — every write must reach and be acknowledged by
+other nodes before it's confirmed. Relax consistency and you can answer from the
+nearest replica immediately.
+
+```text
+PACELC classifications:
+  PC/EC  → consistency always (e.g. strongly-consistent stores)
+  PA/EL  → availability during partition, low latency otherwise (e.g. Cassandra, Dynamo)
+  PC/EL  → consistent under partition, but fast (stale) reads normally
+```
+
+PACELC is the more useful lens day to day, because the latency-vs-consistency
+decision is one you make on *every* write path, partition or not.
+
+## Consistency models: it's a spectrum
+
+"Consistent vs eventual" is a false binary — there's a useful middle. From
+strongest to weakest:
+
+- **Strong (linearizable)** — a read always returns the latest committed write, as
+  if there were one copy. Simplest to reason about, most expensive.
+- **Read-your-writes** — you always see your *own* prior writes, though others'
+  may lag. (Why your comment appears instantly to you but not yet to everyone.)
+- **Monotonic reads** — once you've seen a value, you never see an *older* one; no
+  going backwards in time.
+- **Eventual** — with no new writes, all replicas *eventually* converge. No timing
+  guarantee, just the promise they won't diverge forever.
+
+<Aside title="Eventual doesn't mean 'wrong'">
+Eventual consistency is often heard as "unreliable." It isn't — it's a deliberate
+trade for availability and latency, with defined convergence. The engineering work
+is handling the window before convergence: conflict resolution (last-write-wins,
+vector clocks, CRDTs) and designing UIs that tolerate brief staleness.
+</Aside>
+
+## Back to transactions
+
+This is exactly where the [ACID note's](/knowledge-base/database-transactions-acid/#picking-a-level-in-practice)
+cliffhanger led. A transaction spanning nodes can't lean on single-node atomicity,
+so distributed systems reach for:
+
+- **Two-phase commit (2PC)** — a coordinator asks all participants to *prepare*,
+  then *commit* only if all agree. Gives atomicity across nodes, but blocks if the
+  coordinator dies mid-round and ties availability to the slowest participant — a
+  CP-leaning choice.
+- **Sagas** — break the distributed transaction into a sequence of local
+  transactions, each with a *compensating* action to undo it. No global lock, so it
+  scales and stays available (AP-leaning), at the cost of only *eventual*
+  consistency and having to write the compensations yourself.
+
+The pattern to notice: distributed correctness is the same CAP dial. 2PC buys
+consistency by giving up availability; sagas buy availability by relaxing
+consistency.
+
+## At a glance
+
+| Concept | The one-liner |
+| --- | --- |
+| **CAP** | On a partition, choose Consistency **or** Availability — not both |
+| **Partition tolerance** | Not optional; networks fail, so it's a given |
+| **CP** | Refuse requests to avoid stale/wrong data |
+| **AP** | Stay up and answer, reconcile later |
+| **PACELC** | Even *without* a partition, trade Latency vs Consistency |
+| **Strong consistency** | Reads always see the latest write |
+| **Eventual consistency** | Replicas converge given enough time |
+| **2PC** | Atomic across nodes, but blocking (CP-leaning) |
+| **Saga** | Local txns + compensations; available but eventually consistent (AP-leaning) |
+
+The model worth keeping: **there is no free distributed consistency.** CAP names
+the choice you're forced into during a partition; PACELC names the one you're
+making on every request otherwise. Good distributed design is being deliberate
+about that dial per operation — not picking a database and hoping.
