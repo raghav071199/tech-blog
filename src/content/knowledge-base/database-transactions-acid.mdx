@@ -1,0 +1,183 @@
+---
+title: 'Transactions, ACID, and Isolation'
+description: 'What a database transaction actually guarantees — the four ACID properties, the read anomalies isolation levels exist to prevent, and how locking and MVCC deliver them.'
+pubDate: 'Jul 29 2026'
+updatedDate: 'Jul 29 2026'
+tags: ['Databases', 'System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+A **transaction** is a group of reads and writes the database treats as a single,
+indivisible unit of work: either all of it happens, or none of it does. That one
+guarantee is what lets you move money between two accounts without inventing or
+destroying any along the way. This note covers what a transaction promises
+(**ACID**), the concurrency bugs those promises rule out, and the isolation levels
+you actually tune in practice.
+
+```sql
+BEGIN;
+  UPDATE accounts SET balance = balance - 100 WHERE id = 'alice';
+  UPDATE accounts SET balance = balance + 100 WHERE id = 'bob';
+COMMIT;   -- both updates land, or neither does
+```
+
+If the process crashes between the two `UPDATE`s, a transactional database rolls
+the first one back. Alice is never debited without Bob being credited.
+
+## ACID, one property at a time
+
+ACID is the four guarantees a transaction makes. They're often recited as a block;
+they're clearer separated.
+
+### Atomicity
+
+> All or nothing. A transaction's statements either all commit or all roll back.
+
+There is no partial state visible after the fact. The transfer above is atomic:
+the debit and credit are one unit. Databases deliver this with a **write-ahead
+log** — changes are journaled before they're applied, so an interrupted
+transaction can be undone on recovery.
+
+### Consistency
+
+> A transaction moves the database from one valid state to another.
+
+"Valid" means all declared rules hold: constraints, foreign keys, unique indexes,
+triggers. If a transaction would violate one — say, a `CHECK (balance >= 0)` — the
+whole thing is rejected and rolled back.
+
+<Aside>
+The **C** is the odd one out. Atomicity, Isolation, and Durability are properties
+the *database* enforces. Consistency is partly on *you*: the DB enforces the
+constraints you declare, but "a transfer must not change the total money supply" is
+a rule only your transaction logic can guarantee.
+</Aside>
+
+### Isolation
+
+> Concurrent transactions don't step on each other; each runs as if it were alone.
+
+This is the hard one, and the one you actually tune. Full isolation (every
+transaction behaves as though it ran serially) is expensive, so databases offer
+**levels** that trade isolation for concurrency — the rest of this note is mostly
+about that trade.
+
+### Durability
+
+> Once committed, it survives — even a crash the next millisecond.
+
+A `COMMIT` that returned success means the data is on stable storage (or safely
+replicated). Power loss won't lose it. This is again the write-ahead log: the
+commit isn't acknowledged until the log record is flushed to disk.
+
+## The read anomalies isolation prevents
+
+Before the levels make sense, you need the bugs they exist to stop. Each is a way
+concurrent transactions can produce a result no serial ordering would.
+
+- **Dirty read** — you read a row another transaction has written but *not yet
+  committed*. If it rolls back, you acted on data that never officially existed.
+- **Non-repeatable read** — you read a row twice in one transaction and get
+  different values, because another transaction committed a change in between.
+- **Phantom read** — you run the same range query twice and the *set of rows*
+  changes, because another transaction inserted or deleted rows matching your
+  `WHERE`.
+
+<Aside title="Non-repeatable vs phantom">
+Both are "I read again and it changed," so they blur. The distinction: a
+non-repeatable read is an **existing row's value** changing; a phantom is **rows
+appearing or disappearing** from a range. Different mechanisms are needed to stop
+each, which is exactly why they're separate levels.
+</Aside>
+
+## Isolation levels
+
+The SQL standard defines four levels by which anomalies they forbid. Higher
+isolation = fewer anomalies, less concurrency.
+
+| Level | Dirty read | Non-repeatable read | Phantom |
+| --- | --- | --- | --- |
+| **Read Uncommitted** | Possible | Possible | Possible |
+| **Read Committed** | Prevented | Possible | Possible |
+| **Repeatable Read** | Prevented | Prevented | Possible* |
+| **Serializable** | Prevented | Prevented | Prevented |
+
+```sql
+-- set per-transaction; the default varies by database
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+BEGIN;
+  SELECT balance FROM accounts WHERE id = 'alice'; -- stable for this txn's lifetime
+  -- ...
+COMMIT;
+```
+
+<Aside title="Defaults and the asterisk">
+**Read Committed** is the default in PostgreSQL, Oracle, and SQL Server;
+**Repeatable Read** is MySQL/InnoDB's default. The asterisk: the standard *allows*
+phantoms at Repeatable Read, but some engines (notably InnoDB, via next-key
+locking) prevent them anyway. Never assume — check your engine's docs, because
+"Repeatable Read" doesn't mean the same thing everywhere.
+</Aside>
+
+## How isolation is enforced: locking vs MVCC
+
+Two mechanisms deliver these guarantees, and knowing which your database uses
+explains its performance behavior.
+
+**Pessimistic locking** takes locks before touching data: shared (read) locks and
+exclusive (write) locks. Correct, but readers and writers block each other, and
+lock contention becomes the bottleneck under load.
+
+**MVCC (Multi-Version Concurrency Control)** keeps multiple versions of each row.
+A reader sees a consistent *snapshot* as of when its transaction (or statement)
+started, while writers create new versions. The payoff: **readers never block
+writers and writers never block readers.** This is how Postgres and InnoDB give you
+Read Committed / Repeatable Read cheaply.
+
+<Aside title="The write-conflict catch">
+MVCC makes reads cheap but doesn't make write conflicts disappear — it defers them.
+Two transactions updating the same row still serialize, and at Serializable,
+engines detect conflicting snapshots and abort one with a **serialization failure**.
+That means application code calling a Serializable transaction must be ready to
+**retry** — the DB is telling you "re-run this, the world changed underneath you."
+</Aside>
+
+## Picking a level in practice
+
+- **Read Committed** (the common default) is right for the large majority of OLTP
+  work. You won't see uncommitted garbage; occasional non-repeatable reads rarely
+  matter.
+- Step up to **Repeatable Read / Serializable** for logic that reads a value and
+  writes based on it within the same transaction — balance checks, inventory
+  decrements, "insert if not exists." Here a non-repeatable read or phantom is an
+  actual correctness bug.
+- Reserve **Serializable** for the cases that must be provably correct under
+  concurrency, and design for retries.
+
+<Aside>
+ACID describes a *single* database. The moment a transaction spans services or
+shards, you're in distributed-systems territory — two-phase commit, sagas, and the
+consistency trade-offs of CAP — which is a separate topic from the single-node
+guarantees here.
+</Aside>
+
+## At a glance
+
+| Concept | The one-liner |
+| --- | --- |
+| **Transaction** | A group of operations that commit all-or-nothing |
+| **Atomicity** | All statements land, or none do |
+| **Consistency** | Only valid states (constraints + your logic) are committed |
+| **Isolation** | Concurrent transactions don't corrupt each other |
+| **Durability** | A committed write survives a crash |
+| **Dirty read** | Reading another txn's uncommitted write |
+| **Non-repeatable read** | A row's value changes between two reads |
+| **Phantom read** | Rows enter/leave a range between two queries |
+| **MVCC** | Versioned rows so readers and writers don't block |
+
+The mental model worth keeping: **ACID is the contract, isolation levels are the
+dial, and locking/MVCC is the machinery.** You spend most of your time on the dial
+— and the skill is matching the level to whether a given piece of logic actually
+reads-then-writes, or just reads.

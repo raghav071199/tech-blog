@@ -1,0 +1,231 @@
+---
+title: 'Design Patterns Worth Memorizing'
+description: 'The handful of Gang of Four patterns that actually earn their place in day-to-day code — each with its intent, the problem it solves, and a tight before/after in Java.'
+pubDate: 'Jul 29 2026'
+updatedDate: 'Jul 29 2026'
+tags: ['OOP', 'Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+The Gang of Four catalogued 23 patterns. You don't need all of them — most either
+fell out of favour or show up once a career. This is the short list I actually
+reach for, grouped by intent: each with a one-line purpose, the problem it fixes,
+and a minimal before/after.
+
+<Aside title="Patterns are SOLID, applied">
+Most of these are just a [SOLID principle](/knowledge-base/solid-principles/) made
+concrete. Strategy *is* Open/Closed; the abstractions you inject *are* Dependency
+Inversion. If a pattern feels arbitrary, ask which principle it's protecting — the
+answer is usually right there.
+</Aside>
+
+## Strategy
+
+> Make a family of algorithms interchangeable by putting each behind a common interface.
+
+The fix for a `switch` that grows a branch per variant — the same
+[Open/Closed](/knowledge-base/solid-principles/#o--openclosed-principle) smell.
+Swap behavior by swapping an object, not by editing a method.
+
+```java
+// Before: adding a shipping type reopens this method
+double cost(Order o) {
+    if (o.ship == STANDARD) return 5.0;
+    if (o.ship == EXPRESS)  return 15.0;
+    // ...every new option edits tested code
+}
+```
+
+```java
+// After: a strategy per algorithm; Checkout works with any of them
+interface ShippingCost { double of(Order o); }
+
+class Standard implements ShippingCost { public double of(Order o) { return 5.0; } }
+class Express  implements ShippingCost { public double of(Order o) { return 15.0; } }
+
+class Checkout {
+    private final ShippingCost cost;                 // holds the interface, not a concrete type
+    Checkout(ShippingCost cost) { this.cost = cost; }
+
+    double total(Order o) {
+        return o.subtotal() + cost.of(o);            // uses whichever strategy it was given
+    }
+}
+
+// The choice lives outside Checkout — swap the object, don't edit the class
+Checkout express = new Checkout(new Express());
+Checkout cheap   = new Checkout(new Standard());
+```
+
+## Observer
+
+> Let objects subscribe to an event source and get notified on change.
+
+Decouples "something happened" from "who cares." The subject holds no knowledge of
+its listeners beyond an interface — you add reactions without touching it.
+
+```java
+interface OrderListener { void onPlaced(Order o); }
+
+class OrderService {
+    private final List<OrderListener> listeners = new ArrayList<>();
+    void subscribe(OrderListener l) { listeners.add(l); }
+
+    void place(Order o) {
+        // ...persist...
+        listeners.forEach(l -> l.onPlaced(o)); // email, analytics, inventory — all opt-in
+    }
+}
+```
+
+<Aside>
+This is the backbone of event-driven UIs and pub/sub. Reactive streams (RxJava,
+`Flow`, `Observable`) are Observer scaled up with backpressure and composition.
+</Aside>
+
+## Factory Method
+
+> Defer *which* concrete type to instantiate to a dedicated method or class.
+
+Removes `new ConcreteThing()` from code that shouldn't know the concrete type —
+[Dependency Inversion](/knowledge-base/solid-principles/#d--dependency-inversion-principle)
+at the point of creation. Callers ask for *what* they want, not *how* it's built.
+
+```java
+// Before: caller is welded to the concrete class
+Notifier n = new EmailNotifier(smtpConfig);
+```
+
+```java
+// After: creation logic lives in one place, caller stays abstract
+interface Notifier { void send(String msg); }
+
+class NotifierFactory {
+    static Notifier forChannel(Channel c) {
+        return switch (c) {
+            case EMAIL -> new EmailNotifier(/* ... */);
+            case SMS   -> new SmsNotifier(/* ... */);
+        };
+    }
+}
+```
+
+The `switch` is fine *here* — it's isolated to the factory, the one place whose
+job is knowing the concrete types.
+
+## Builder
+
+> Construct a complex object step by step, instead of a telescoping constructor.
+
+Kills the `new Pizza(true, false, true, false, 12, null)` problem: unreadable
+positional args, and a new constructor for every optional combination.
+
+```java
+Pizza p = new Pizza.Builder()
+    .size(12)
+    .cheese(true)
+    .topping("mushroom")
+    .build(); // readable, and each field is optional
+```
+
+<Aside>
+Prefer Builder once a constructor has more than a few args or several optionals.
+In Kotlin, named/default arguments cover most cases without the boilerplate.
+</Aside>
+
+## Adapter
+
+> Wrap an incompatible interface so it looks like the one your code expects.
+
+The glue for a third-party or legacy class you can't change. Your code depends on
+*your* interface; the adapter translates.
+
+```java
+// You want everything to be a PaymentGateway...
+interface PaymentGateway { void charge(long cents); }
+
+// ...but the vendor SDK speaks a different shape
+class VendorAdapter implements PaymentGateway {
+    private final VendorSdk sdk;
+    public void charge(long cents) {
+        sdk.makePayment(cents / 100.0, "USD"); // translate the call
+    }
+}
+```
+
+## Decorator
+
+> Add behavior to an object by wrapping it, without subclassing.
+
+Layer responsibilities at run time — the alternative to a class explosion like
+`BufferedEncryptedLoggingStream`. Each decorator adds one thing and delegates the
+rest.
+
+```java
+interface DataSource { void write(String data); }
+
+class EncryptedSource implements DataSource {
+    private final DataSource wrapped; // wraps any DataSource
+    public void write(String data) { wrapped.write(encrypt(data)); }
+}
+
+// Compose freely: encryption over compression over a file
+DataSource ds = new EncryptedSource(new CompressedSource(new FileSource()));
+```
+
+<Aside>
+`java.io` is Decorator end to end — `new BufferedReader(new InputStreamReader(...))`
+is exactly this pattern.
+</Aside>
+
+## Singleton (know the trade-off)
+
+> Guarantee one instance with a global access point.
+
+Included because it's the most *overused* pattern — worth knowing precisely so you
+know when **not** to reach for it.
+
+```java
+enum Config { INSTANCE; /* enum is the thread-safe, serialization-safe way */ }
+```
+
+The catch: a hand-rolled Singleton is hidden global state. It makes code hard to
+test (you can't swap it for a fake) and couples everything that touches it. The
+industry-standard fix is to let a DI container own the single instance — Spring
+beans are singleton-scoped by default, so you get "exactly one" *without* the
+global access point:
+
+```java
+@Service // one instance per container, managed for you
+class RateLimiter { /* ... */ }
+
+@Service
+class OrderService {
+    private final RateLimiter limiter;
+    OrderService(RateLimiter limiter) { this.limiter = limiter; } // injected, not global
+}
+```
+
+Same "one instance" guarantee, but the dependency is explicit in the constructor
+and trivially swapped for a fake in tests — see
+[Why Constructor Injection Won](/blog/dependency-injection-spring-boot-constructor-injection/).
+Reach for the hand-rolled `enum` Singleton only outside a DI framework.
+
+## At a glance
+
+| Pattern | Category | Use when… |
+| --- | --- | --- |
+| **Strategy** | Behavioral | Behavior varies and you'd otherwise `switch` on a type |
+| **Observer** | Behavioral | Many objects must react to an event without the source knowing them |
+| **Factory Method** | Creational | Callers shouldn't know the concrete class they're getting |
+| **Builder** | Creational | A constructor has too many args or optionals |
+| **Adapter** | Structural | An external interface doesn't match what your code expects |
+| **Decorator** | Structural | You need to stack optional behaviors without subclass explosion |
+| **Singleton** | Creational | You need exactly one — but prefer a DI-managed instance |
+
+Patterns are a shared vocabulary, not a checklist to satisfy. Reach for one when
+you recognize its problem in your code — never bend the code to fit a pattern. The
+best use of this list is spotting the smell ("this `switch` keeps growing") and
+remembering there's a named, well-understood shape that fixes it.
