@@ -1,0 +1,183 @@
+---
+title: 'SOLID Principles'
+description: 'The five object-oriented design principles behind code that stays easy to change — each stated plainly, with a smell it fixes and a before/after in Java.'
+pubDate: 'Jul 29 2026'
+updatedDate: 'Jul 29 2026'
+tags: ['OOP', 'Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+SOLID is five design principles that, taken together, keep object-oriented code
+**easy to change** — the property that actually decays as a codebase grows. Each
+one targets a specific way a design goes rigid or fragile. This is a quick
+reference: the one-line statement, the smell it fixes, and a minimal before/after.
+
+<Aside title="The through-line">
+Every principle here is really about one thing: **isolating change**. A good
+design lets you make a likely future change in one place, without a ripple through
+code that had no reason to care. Keep that lens and the five stop feeling like
+trivia.
+</Aside>
+
+## S — Single Responsibility Principle
+
+> A class should have one reason to change.
+
+"Responsibility" is best read as *a source of change*. If a class is touched for
+two unrelated reasons — say, the way an invoice is calculated **and** the way it's
+formatted for print — those concerns will fight over the same file and leak into
+each other.
+
+```java
+// Before: two reasons to change live in one class
+class Invoice {
+    BigDecimal computeTotal() { /* tax + line-item rules */ }
+    String toPdf() { /* layout, fonts, page breaks */ }
+}
+```
+
+```java
+// After: each class changes for exactly one reason
+class Invoice {
+    BigDecimal computeTotal() { /* tax + line-item rules */ }
+}
+
+class InvoicePdfRenderer {
+    String render(Invoice invoice) { /* layout, fonts, page breaks */ }
+}
+```
+
+Now a change to PDF layout can't break total calculation, and vice versa.
+
+## O — Open/Closed Principle
+
+> Open for extension, closed for modification.
+
+You should be able to add new behavior **without editing existing, tested code**.
+The tell is a `switch`/`if-else` on a type that grows a new branch every time a
+variant is added — each edit risks the branches already working.
+
+```java
+// Before: every new payment type reopens this method
+BigDecimal fee(Payment p) {
+    if (p.type == CARD)   return p.amount.multiply(0.029);
+    if (p.type == BANK)   return BigDecimal.valueOf(0.25);
+    // add WALLET here, and here, and here...
+}
+```
+
+```java
+// After: add a type by adding a class, not by editing this code
+interface Payment { BigDecimal fee(); }
+
+class CardPayment implements Payment {
+    public BigDecimal fee() { return amount.multiply(0.029); }
+}
+class BankPayment implements Payment {
+    public BigDecimal fee() { return BigDecimal.valueOf(0.25); }
+}
+// WALLET? new class. Nothing above changes.
+```
+
+Adding `WalletPayment` is now purely additive — the existing, tested classes are
+never reopened.
+
+## L — Liskov Substitution Principle
+
+> A subtype must be usable anywhere its base type is expected — without surprises.
+
+Inheritance claims an *is-a* relationship. LSP says that claim must hold
+*behaviorally*, not just compile. The classic violation is the `Square extends
+Rectangle` trap: a square that overrides `setWidth` to also change height breaks
+any code that expected width and height to move independently.
+
+```java
+Rectangle r = new Square();
+r.setWidth(5);
+r.setHeight(4);
+assert r.area() == 20; // fails for Square — it forced width == height
+```
+
+The subtype technically satisfies the interface but **violates the caller's
+expectations**. Fix it by not modeling the relationship as inheritance when the
+behavioral contract doesn't actually hold.
+
+<Aside>
+Practical LSP smells: an override that throws `UnsupportedOperationException`,
+strengthens a precondition ("this method now rejects nulls the base accepted"), or
+weakens a postcondition. Any of these means callers of the base type can be
+surprised.
+</Aside>
+
+## I — Interface Segregation Principle
+
+> No client should be forced to depend on methods it doesn't use.
+
+Fat interfaces couple unrelated clients. If `Machine` declares `print`, `scan`,
+and `fax`, a simple printer is forced to implement `scan` and `fax` it can't do —
+usually by throwing. Split the interface along how it's actually consumed.
+
+```java
+// Before: a fat interface every device must fully implement
+interface Machine { void print(); void scan(); void fax(); }
+
+// After: small, role-based interfaces
+interface Printer { void print(); }
+interface Scanner { void scan(); }
+
+class SimplePrinter implements Printer { public void print() { /* ... */ } }
+class AllInOne implements Printer, Scanner { /* implements both */ }
+```
+
+Each class depends only on what it genuinely provides.
+
+## D — Dependency Inversion Principle
+
+> Depend on abstractions, not concretions. High-level policy shouldn't depend on
+> low-level detail.
+
+High-level code (business rules) should not be nailed to a concrete low-level
+implementation (a specific database, HTTP client, or vendor SDK). Both should
+depend on an interface the high-level module owns.
+
+```java
+// Before: the service is welded to a concrete Postgres class
+class OrderService {
+    private final PostgresOrderRepo repo = new PostgresOrderRepo(); // rigid
+}
+```
+
+```java
+// After: the service depends on an abstraction it defines
+interface OrderRepository { void save(Order o); }
+
+class OrderService {
+    private final OrderRepository repo;
+    OrderService(OrderRepository repo) { this.repo = repo; } // injected
+}
+```
+
+Now Postgres, an in-memory fake for tests, or a future DynamoDB implementation all
+slot in without touching `OrderService`.
+
+<Aside>
+This is exactly the principle that makes dependency injection worth doing — the
+run-time mechanics of "who hands the abstraction in" are covered in
+[Dependency Injection in Spring Boot: Why Constructor Injection Won](/blog/dependency-injection-spring-boot-constructor-injection/).
+</Aside>
+
+## At a glance
+
+| Principle | One-line rule | Smell it fixes |
+| --- | --- | --- |
+| **S**ingle Responsibility | One reason to change per class | A class edited for unrelated reasons |
+| **O**pen/Closed | Extend without modifying | A growing `switch` on type |
+| **L**iskov Substitution | Subtypes honor the base contract | Override that throws or surprises |
+| **I**nterface Segregation | No unused method dependencies | Fat interface with `UnsupportedOperation` |
+| **D**ependency Inversion | Depend on abstractions | `new ConcreteThing()` inside policy code |
+
+The goal was never to memorize five acronyms — it's to notice, while writing a
+class, *what would force this to change* and put a seam there. SOLID is just the
+catalog of the seams that pay off most often.

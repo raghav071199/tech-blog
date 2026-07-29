@@ -1,0 +1,305 @@
+---
+import type { CollectionEntry } from 'astro:content';
+import type { MarkdownHeading } from 'astro';
+import BaseHead from '../components/BaseHead.astro';
+import Footer from '../components/Footer.astro';
+import FormattedDate from '../components/FormattedDate.astro';
+import Header from '../components/Header.astro';
+
+type Props = CollectionEntry<'knowledgeBase'>['data'] & {
+	related?: CollectionEntry<'knowledgeBase'>[];
+	// Headings from the rendered entry, used to build the table of contents.
+	headings?: MarkdownHeading[];
+	// Section this entry belongs to, used to build tag/related links.
+	basePath?: string;
+};
+
+const {
+	title,
+	description,
+	pubDate,
+	updatedDate,
+	tags = [],
+	related = [],
+	headings = [],
+	basePath = '/knowledge-base',
+} = Astro.props;
+
+// Only surface h2/h3 in the contents rail — deeper nesting adds noise.
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+<html lang="en">
+	<head>
+		<BaseHead title={title} description={description} />
+		<style>
+			main {
+				/* Wider than the blog, with small side margins — this is a doc, not a post */
+				width: calc(100% - 3rem);
+				max-width: 1180px;
+				margin: 2rem auto 0;
+			}
+			.entry-head {
+				border-bottom: 1px solid rgb(var(--gray-light));
+				padding-bottom: 1.25rem;
+				margin-bottom: 2rem;
+			}
+			.eyebrow {
+				font-size: 0.75rem;
+				font-weight: 700;
+				letter-spacing: 0.08em;
+				text-transform: uppercase;
+				color: var(--accent);
+				margin: 0 0 0.5rem;
+			}
+			.entry-head h1 {
+				font-size: 2.4rem;
+				line-height: 1.1;
+				margin: 0 0 0.6rem;
+			}
+			.entry-head .lede {
+				color: rgb(var(--gray-dark));
+				font-size: 1.1rem;
+				margin: 0 0 0.9rem;
+				max-width: 70ch;
+			}
+			.meta {
+				display: flex;
+				flex-wrap: wrap;
+				align-items: center;
+				gap: 0.75rem;
+				font-size: 0.85rem;
+				color: rgb(var(--gray));
+			}
+			.meta .tags {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.4rem;
+			}
+			.meta .tags a {
+				font-size: 0.72rem;
+				padding: 0.12rem 0.6rem;
+				border-radius: 999px;
+				background: rgb(var(--gray-light));
+				color: rgb(var(--gray-dark));
+				text-decoration: none;
+				transition: 0.15s ease;
+			}
+			.meta .tags a:hover {
+				background: var(--accent);
+				color: #fff;
+			}
+			/* Doc body: wide reading column + sticky contents rail */
+			.layout {
+				display: grid;
+				grid-template-columns: 1fr 220px;
+				gap: 3rem;
+				align-items: start;
+			}
+			.prose {
+				min-width: 0;
+				color: rgb(var(--gray-dark));
+			}
+			.prose :global(h2) {
+				scroll-margin-top: 1.5rem;
+				margin-top: 2.2rem;
+			}
+			.prose :global(h3) {
+				scroll-margin-top: 1.5rem;
+			}
+			.prose :global(pre) {
+				border-radius: 8px;
+			}
+			.toc {
+				position: sticky;
+				top: 1.5rem;
+				font-size: 0.85rem;
+			}
+			.toc p {
+				font-size: 0.72rem;
+				font-weight: 700;
+				letter-spacing: 0.08em;
+				text-transform: uppercase;
+				color: rgb(var(--gray));
+				margin: 0 0 0.6rem;
+			}
+			.toc ul {
+				list-style: none;
+				margin: 0;
+				padding: 0;
+				border-left: 2px solid rgb(var(--gray-light));
+			}
+			.toc li a {
+				display: block;
+				padding: 0.2rem 0 0.2rem 0.9rem;
+				margin-left: -2px;
+				border-left: 2px solid transparent;
+				color: rgb(var(--gray));
+				text-decoration: none;
+				line-height: 1.35;
+				transition: 0.15s ease;
+			}
+			.toc li.sub a {
+				padding-left: 1.7rem;
+				font-size: 0.8rem;
+			}
+			.toc li a:hover,
+			.toc li a.active {
+				color: var(--accent);
+				border-left-color: var(--accent);
+			}
+			.related {
+				margin: 3.5rem 0 0;
+				padding-top: 2rem;
+				border-top: 1px solid rgb(var(--gray-light));
+			}
+			.related h2 {
+				font-size: 1.3rem;
+				margin-bottom: 1rem;
+			}
+			.related ul {
+				list-style: none;
+				margin: 0;
+				padding: 0;
+				display: grid;
+				gap: 0.75rem;
+			}
+			.related a {
+				display: flex;
+				align-items: baseline;
+				justify-content: space-between;
+				gap: 1rem;
+				text-decoration: none;
+				color: rgb(var(--black));
+				padding: 0.5rem 0;
+				border-bottom: 1px solid rgb(var(--gray-light));
+				transition: 0.15s ease;
+			}
+			.related a:hover {
+				color: var(--accent);
+				padding-left: 0.5rem;
+			}
+			.related .r-date {
+				color: rgb(var(--gray));
+				font-size: 0.85rem;
+				white-space: nowrap;
+			}
+			@media (max-width: 900px) {
+				.layout {
+					grid-template-columns: 1fr;
+					gap: 0;
+				}
+				.toc {
+					display: none;
+				}
+			}
+		</style>
+	</head>
+
+	<body>
+		<Header />
+		<main>
+			<article>
+				<header class="entry-head">
+					<p class="eyebrow">Concepts &amp; Notes</p>
+					<h1>{title}</h1>
+					<p class="lede">{description}</p>
+					<div class="meta">
+						{
+							updatedDate ? (
+								<span>
+									Updated <FormattedDate date={updatedDate} />
+								</span>
+							) : (
+								<span>
+									<FormattedDate date={pubDate} />
+								</span>
+							)
+						}
+						{
+							tags.length > 0 && (
+								<span class="tags">
+									{tags.map((tag) => (
+										<a href={`${basePath}/?tag=${encodeURIComponent(tag)}`}>{tag}</a>
+									))}
+								</span>
+							)
+						}
+					</div>
+				</header>
+
+				<div class="layout">
+					<div class="prose">
+						<slot />
+					</div>
+					{
+						toc.length > 0 && (
+							<aside class="toc" aria-label="On this page">
+								<p>On this page</p>
+								<ul>
+									{toc.map((h) => (
+										<li class:list={[{ sub: h.depth === 3 }]}>
+											<a href={`#${h.slug}`}>{h.text}</a>
+										</li>
+									))}
+								</ul>
+							</aside>
+						)
+					}
+				</div>
+
+				{
+					related.length > 0 && (
+						<aside class="related">
+							<h2>Related notes</h2>
+							<ul>
+								{related.map((post) => (
+									<li>
+										<a href={`${basePath}/${post.id}/`}>
+											<span>{post.data.title}</span>
+											<span class="r-date">
+												<FormattedDate date={post.data.pubDate} />
+											</span>
+										</a>
+									</li>
+								))}
+							</ul>
+						</aside>
+					)
+				}
+			</article>
+		</main>
+		<Footer />
+		<script>
+			// Highlight the current section in the contents rail as you scroll.
+			const links = new Map<string, HTMLAnchorElement>();
+			document
+				.querySelectorAll<HTMLAnchorElement>('.toc a')
+				.forEach((a) => links.set(a.getAttribute('href')!.slice(1), a));
+
+			const headings = document.querySelectorAll<HTMLElement>(
+				'.prose h2, .prose h3',
+			);
+
+			if (links.size && headings.length && 'IntersectionObserver' in window) {
+				let activeId = '';
+				const setActive = (id: string) => {
+					if (id === activeId) return;
+					links.get(activeId)?.classList.remove('active');
+					links.get(id)?.classList.add('active');
+					activeId = id;
+				};
+
+				const observer = new IntersectionObserver(
+					(entries) => {
+						for (const entry of entries) {
+							if (entry.isIntersecting) setActive(entry.target.id);
+						}
+					},
+					{ rootMargin: '0px 0px -75% 0px', threshold: 0 },
+				);
+				headings.forEach((h) => observer.observe(h));
+			}
+		</script>
+	</body>
+</html>
