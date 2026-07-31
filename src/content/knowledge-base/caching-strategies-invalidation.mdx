@@ -1,0 +1,242 @@
+---
+title: 'Caching Strategies and Invalidation'
+description: 'Where a cached value comes from, when it goes stale, and what to do about it — cache-aside vs write-through, TTL vs explicit invalidation, eviction policies, and the stampede problem.'
+pubDate: 'Jul 30 2026'
+updatedDate: 'Jul 30 2026'
+tags: ['System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+A cache is a copy of data kept somewhere faster than its source. It's the cheapest
+way to make reads fast and the easiest way to serve wrong data — those two facts are
+the whole topic. This note covers the strategies for reading and writing through a
+cache, how to keep it from going stale, and the one failure mode that catches people
+out.
+
+## Why cache
+
+The motivation is the gap between a memory lookup and a database round trip — often
+three orders of magnitude. If the same value is read far more often than it changes,
+caching it converts repeated expensive work into one expensive read plus many cheap
+ones.
+
+Caches sit at several layers, and a request may pass through all of them:
+
+| Layer | Example | Typical scope |
+| --- | --- | --- |
+| Client | browser cache, app memory | One user |
+| Edge / CDN | CloudFront, Cloudflare | One region |
+| Application | Redis, Memcached, in-process map | One service |
+| Database | buffer pool, query cache | One DB |
+
+The metric that decides whether it's working is **hit ratio** — the share of reads
+served from cache.
+
+<Aside title="A low hit ratio is worse than no cache">
+Every miss pays the cache lookup *and* the original read, plus the cost of populating
+the cache. At a 10% hit ratio you've added latency to 90% of requests to save it on
+10%. Before adding a cache, ask whether the access pattern actually has the
+concentration to make hits likely — a cache is only useful where reads are **skewed**
+toward a small hot set.
+</Aside>
+
+The other framing worth holding onto: a cache is **derived state**. The database
+remains the [single source of truth](/knowledge-base/system-design-principles-tenets/#single-source-of-truth);
+the cache is a disposable copy. Anything that treats the cache as authoritative has
+made a correctness mistake.
+
+## Read strategies
+
+> How does a value get *into* the cache?
+
+**Cache-aside (lazy loading)** — the application checks the cache, and on a miss
+reads the database and populates it. This is the default, and what most people mean
+by "caching."
+
+```text
+read(key):
+    value = cache.get(key)
+    if value is null:              # miss
+        value = db.query(key)
+        cache.set(key, value, ttl)
+    return value
+```
+
+Properties: only requested data is ever cached (no waste), and a cache failure
+degrades to slow-but-working rather than broken. The costs are a **miss penalty**
+(the first read pays both lookups) and a **cold cache** after every restart or
+deploy.
+
+**Read-through** — the application only talks to the cache; the cache itself fetches
+from the database on a miss. Same behavior from the caller's side, but the fetch
+logic lives in the caching layer rather than your code.
+
+```text
+read(key):
+    return cache.get(key)     # cache handles the miss internally
+```
+
+The trade is simplicity in your application versus a cache that must know how to
+load your data — and a harder time degrading gracefully if the cache is unavailable.
+
+## Write strategies
+
+> When data changes, what happens to the cached copy?
+
+**Write-through** — write to the cache and the database synchronously, in one
+operation.
+
+```text
+write(key, value):
+    db.save(key, value)
+    cache.set(key, value)     # both updated before returning
+```
+
+The cache is never stale, and the value is already warm for the next read. You pay
+for it in write latency — every write does two operations — and you cache data that
+may never be read.
+
+**Write-behind (write-back)** — write to the cache, acknowledge, and flush to the
+database asynchronously.
+
+```text
+write(key, value):
+    cache.set(key, value)
+    queue.enqueue(key)        # database updated later
+```
+
+Fastest writes, and it naturally batches bursts of updates to the same key. The
+risk is real: if the cache dies before flushing, **acknowledged writes are lost**.
+Only appropriate where losing recent writes is survivable — metrics, counters, view
+tallies — not for orders or payments.
+
+**Write-around (write-invalidate)** — write to the database and simply *evict* the
+key from the cache.
+
+```text
+write(key, value):
+    db.save(key, value)
+    cache.delete(key)         # next read repopulates
+```
+
+The pragmatic default, and the natural partner to cache-aside: no stale value can
+survive, and you only cache what someone actually reads back.
+
+| Strategy | Staleness | Write latency | Risk |
+| --- | --- | --- | --- |
+| **Write-through** | None | Higher (two writes) | Caches unread data |
+| **Write-behind** | None in cache | Lowest | Data loss if cache fails |
+| **Write-around** | None (evicted) | Normal | Next read pays a miss |
+
+## Invalidation
+
+> Getting a stale value out of the cache — the genuinely hard part.
+
+There's a well-worn line that the two hard problems in computer science are cache
+invalidation and naming things. The difficulty is that the cache has no idea the
+underlying data changed; something has to tell it, or it has to give up on its copy
+after a while.
+
+**TTL (time to live)** — every entry expires after a fixed period.
+
+```text
+cache.set(key, value, ttl=300)    # gone after 5 minutes
+```
+
+Requires no coordination whatsoever, and that's why it's the workhorse. It gives you
+a **bounded staleness window**: with a 5-minute TTL you're promising the data is at
+most 5 minutes old. Choosing the number is a product decision, not a technical one —
+how stale can this specific value be before someone is misled?
+
+**Explicit invalidation** — whoever writes the data evicts or updates the key
+(write-around and write-through above are both forms of this).
+
+Precise, and the value is corrected immediately rather than after a delay. The
+failure mode is coverage: **every** code path that modifies the data must invalidate,
+and the one that forgets produces a value that is stale *indefinitely*. Batch jobs,
+admin tools, and manual database fixes are the usual culprits.
+
+<Aside title="Use both">
+These aren't alternatives — the common production setup is explicit invalidation for
+correctness *plus* a TTL as a backstop. Explicit invalidation handles the paths you
+know about; the TTL puts a ceiling on the damage from the ones you missed. A cache
+with no TTL anywhere is a cache that will eventually hold something wrong forever.
+</Aside>
+
+Staleness itself isn't a bug — it's the trade you made for speed. It only becomes a
+bug when the window is undefined or longer than the product can tolerate. (This is
+the same [eventual consistency](/knowledge-base/consistency-in-distributed-databases/#consistency-models-its-a-spectrum)
+spectrum, applied to a cache.)
+
+## Eviction policies
+
+Caches are bounded, so when a cache is full something must be removed to admit a new
+entry. That's eviction — distinct from invalidation, which removes entries because
+they're *wrong* rather than because you're *out of room*.
+
+- **LRU (least recently used)** — evict what hasn't been touched for longest. The
+  sensible default; assumes recent access predicts future access.
+- **LFU (least frequently used)** — evict what's accessed least often. Better for
+  stable hot sets, but slow to let go of something that *used* to be popular.
+- **FIFO** — evict the oldest inserted, regardless of use. Simple and rarely what
+  you want.
+- **TTL-based** — expiry does the evicting for you.
+
+The number that actually matters is whether your **working set** — the data actually
+being read in a given period — fits in the cache. If it doesn't, entries get evicted
+before they're reused, hit ratio collapses, and you're **thrashing**: paying cache
+overhead for nearly no benefit. The fix is a bigger cache or a smaller working set,
+not a cleverer policy.
+
+## Cache stampede
+
+The failure mode worth knowing by name. A popular key expires, and every concurrent
+request misses at the same instant — so they all hit the database simultaneously for
+the same value.
+
+```text
+Hot key expires
+    → 5,000 in-flight requests all miss
+    → 5,000 identical database queries
+    → database saturates, latency spikes, requests time out
+```
+
+The cache was protecting the database, and its expiry removed that protection in one
+step. Two straightforward fixes:
+
+- **Request coalescing (single-flight)** — let the first miss fetch while the others
+  wait for its result. One database query instead of thousands.
+- **Jittered TTLs** — randomize expiry (`ttl = 300 + random(0, 60)`) so keys don't
+  expire in lockstep. Exactly the same reasoning as
+  [jitter in retry backoff](/knowledge-base/idempotency-retries-backoff/#backoff-and-jitter):
+  spread the herd out in time.
+
+<Aside>
+This is also why a cache quietly becomes a **hard dependency**. If your database
+cannot survive its normal traffic without cache hits, then losing the cache is an
+outage — not a slowdown. Worth deciding deliberately: can we serve, degraded, with a
+cold cache?
+</Aside>
+
+## At a glance
+
+| Concept | The one-liner |
+| --- | --- |
+| **Hit ratio** | Share of reads served from cache; low ratio means the cache is a net cost |
+| **Cache-aside** | App populates on miss — the default |
+| **Read-through** | The cache fetches on miss, not your code |
+| **Write-through** | Write both synchronously; never stale, slower writes |
+| **Write-behind** | Write cache now, DB later; fast but can lose data |
+| **Write-around** | Write DB, evict key; pairs naturally with cache-aside |
+| **TTL** | Expiry with a bounded staleness window; needs no coordination |
+| **Explicit invalidation** | Writers evict; precise, but one missed path = permanent staleness |
+| **LRU / LFU** | Evict least recently / least frequently used |
+| **Thrashing** | Working set exceeds cache size; hit ratio collapses |
+| **Stampede** | Hot key expires and every request hits the DB at once |
+
+The model worth keeping: **a cache trades correctness for speed, and invalidation is
+how you bound the trade.** Pick a staleness window you can defend out loud, back it
+with a TTL even when you invalidate explicitly, and know what happens to the system
+the day the cache is empty.
