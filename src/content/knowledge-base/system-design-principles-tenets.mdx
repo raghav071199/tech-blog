@@ -1,0 +1,259 @@
+---
+title: 'System Design Principles and Tenets'
+description: 'The properties a well-designed system has, the decision rules for when they conflict, and the practices that follow — the umbrella note the rest of the system design entries hang off.'
+pubDate: 'Jul 30 2026'
+updatedDate: 'Jul 30 2026'
+tags: ['System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+Where [SOLID](/knowledge-base/solid-principles/) governs the design of *classes*,
+these govern the design of *systems*. This note is the umbrella: the **principles**
+(properties you design for), the **tenets** (rules for choosing when principles
+conflict), and the practices that follow. Mechanisms — caching, sharding, load
+balancing, retry policy — get their own notes; here we stay at the level of what
+you're optimizing for and why.
+
+<Aside title="The through-line">
+Almost every principle below is a consequence of one fact: **at scale, individual
+components fail constantly.** Once you accept that failure is the steady state
+rather than the exception, redundancy, statelessness, degradation, and observability
+stop being separate ideas and become the same idea applied in different places.
+</Aside>
+
+## Scalability
+
+> The system handles more load by adding resources — ideally without redesign.
+
+Two directions, and only one of them keeps working:
+
+- **Vertical (scale up)** — a bigger machine. Simple, requires no code changes, and
+  hits a hard ceiling: there is a largest instance, and it's a single point of
+  failure.
+- **Horizontal (scale out)** — more machines. Effectively unbounded and inherently
+  redundant, but only works if requests can go to *any* instance.
+
+The goal is **linear scalability**: double the nodes, double the throughput. Real
+systems fall short of it wherever a shared bottleneck remains — a single database
+primary, a global lock, a hot partition. When you scale out and throughput doesn't
+improve, you've found the thing that isn't scaling.
+
+## Statelessness
+
+> No request depends on state held in the process that served the last one.
+
+This is the *enabler* for horizontal scaling, which is why it's a principle in its
+own right. If a server keeps session data in memory, requests must be pinned to it
+("sticky sessions") — and now instances aren't interchangeable, you can't scale
+freely, and losing that node loses user state.
+
+State doesn't disappear; it **moves somewhere designed to hold it**: a database, a
+shared cache like Redis, or a signed token carried by the client. Application
+servers become disposable, which is what makes autoscaling and rolling deploys
+safe.
+
+## Availability, reliability, durability
+
+Three properties that get used interchangeably and shouldn't be:
+
+- **Availability** — the system responds when asked. Measured in "nines" of uptime.
+- **Reliability** — it responds *correctly*, and keeps doing so over time. An
+  available system returning wrong answers is not reliable.
+- **Durability** — committed data is not lost. Distinct from both: a system can be
+  down (unavailable) while losing nothing (durable).
+
+| Availability | Downtime per year | Downtime per month |
+| --- | --- | --- |
+| 99% ("two nines") | 3.65 days | 7.2 hours |
+| 99.9% | 8.77 hours | 43.8 minutes |
+| 99.95% | 4.38 hours | 21.9 minutes |
+| 99.99% ("four nines") | 52.6 minutes | 4.38 minutes |
+| 99.999% ("five nines") | 5.26 minutes | 26 seconds |
+
+<Aside title="Nines compose badly in series">
+Dependencies in series **multiply**. A request passing through three components that
+are each 99.9% available yields `0.999³ ≈ 99.7%` — you've lost most of a nine just
+by adding hops. Two consequences: every dependency you add costs availability, and
+the only way to *beat* a component's availability is redundancy (parallel paths),
+where the failure probabilities multiply instead — two independent 99% components in
+parallel give `1 − 0.01² = 99.99%`.
+</Aside>
+
+## No single point of failure
+
+> Any one component can fail without taking the system with it.
+
+The design question is always *"what happens when this dies?"* — and if the answer
+is "everything stops," that component needs redundancy. Applies to more than
+servers: a single load balancer, one database primary, one availability zone, one
+deployment pipeline, one on-call engineer who knows how it works.
+
+Related and equally important is **blast radius**: when something does fail, how
+much is affected? Partition into independent **failure domains** (cells, shards,
+zones) so a failure degrades a slice rather than the whole. Redundancy prevents the
+outage; failure domains bound it when prevention fails.
+
+## Design for failure
+
+> Assume every dependency will be slow, unavailable, or wrong — and decide now what
+> happens then.
+
+Not pessimism, just arithmetic: enough components, and something is always broken.
+Concretely, this means every network call needs an answer to four questions:
+
+1. **Timeout** — how long before I give up? (No timeout means inheriting the
+   slowest dependency's worst day.)
+2. **Retry** — is retrying safe, and how do I avoid amplifying a struggling
+   dependency into an outage?
+3. **Idempotency** — if the caller retries, does the operation apply twice?
+4. **Fallback** — cached value, default, or a clean error?
+
+<Aside>
+The mechanics — exponential backoff with jitter, idempotency keys, circuit breakers,
+bulkheads — are their own topic. The *principle* is that these decisions belong in
+the design, not in a bug fix after the first incident.
+</Aside>
+
+## Graceful degradation
+
+> Partial service beats no service.
+
+When a system is overloaded or a dependency is down, the naive behavior is to fail
+everything. The designed behavior is to shed the least valuable work and keep the
+core functioning: serve the product page without the recommendation carousel, take
+the order and process the receipt email later, return slightly stale cached data
+rather than an error.
+
+Two mechanisms worth knowing by name:
+
+- **Load shedding** — deliberately rejecting or deprioritizing excess requests so
+  the system stays responsive for the rest. Better to fast-fail 5% than to
+  brown-out 100% by queueing everything.
+- **Backpressure** — signaling upstream to slow down instead of silently building
+  an unbounded queue. An unbounded queue converts a throughput problem into a
+  latency problem, then into an out-of-memory crash.
+
+## Loose coupling and high cohesion
+
+> Components should know as little about each other as possible, and each should do
+> one thing well.
+
+The system-level echo of [Single Responsibility and Dependency
+Inversion](/knowledge-base/solid-principles/#d--dependency-inversion-principle).
+Coupling shows up as: a schema shared directly between services, a change that
+forces lockstep deploys, or a synchronous call chain where one slow service stalls
+five others.
+
+The main lever is the **communication style** at each boundary:
+
+- **Synchronous** (REST/RPC) — simple, immediate consistency, but couples
+  availability and latency: your caller is only as available as you are.
+- **Asynchronous** (queue/event) — decouples availability and absorbs load spikes,
+  at the cost of eventual consistency and harder debugging.
+
+Neither is correct in general. Use sync when the caller genuinely needs the answer
+to proceed; use async when it just needs the work to eventually happen.
+
+## Single source of truth
+
+> Every piece of data has exactly one authoritative home.
+
+When the same fact lives in two writable places, they *will* diverge — and then
+there's no correct answer, only two wrong ones. Caches and read replicas are fine
+because they're explicitly *derived*: one writer, many readers, with a defined
+staleness window. What breaks is two systems both accepting writes for the same
+fact with no reconciliation rule. If duplication is unavoidable, name the owner and
+make every other copy derived from it.
+
+## Observability by design
+
+> If you can't see it, you can't operate it — and that has to be built in, not
+> bolted on.
+
+Three complementary signals:
+
+- **Metrics** — aggregated numbers over time (rates, latency percentiles, error
+  ratios). Cheap; tells you *that* something is wrong.
+- **Logs** — discrete events with context. Tells you *what* happened.
+- **Traces** — one request's path across services, with timing per hop. Tells you
+  *where* the time or failure was.
+
+Then the operational layer on top:
+
+- **SLI** (indicator) — the metric you actually measure, e.g. p99 latency or the
+  ratio of successful requests.
+- **SLO** (objective) — the target for that SLI, e.g. "99.9% of requests succeed
+  over 30 days."
+- **Error budget** — the allowed failure remaining under the SLO. It turns
+  reliability into a quantity you can *spend*: budget left means ship faster;
+  budget exhausted means stop feature work and fix stability.
+
+<Aside title="Measure percentiles, not averages">
+Averages hide the failures users notice. If p50 is 40ms and p99 is 4s, one request
+in a hundred is having a terrible time — and at scale that's thousands of people,
+often your heaviest users. Design and alert on **p95/p99**, and remember that a
+request fanning out to many dependencies is likely to hit *someone's* p99.
+</Aside>
+
+## Tenets: choosing when principles conflict
+
+Principles describe what's desirable; tenets are how you decide when you can't have
+all of it. These are the judgment calls.
+
+**Nothing is free — name the trade.** Every property above is bought with
+complexity, latency, or cost. A design that claims consistency *and* availability
+*and* low latency hasn't been thought through: on a partition you must choose
+([CAP](/knowledge-base/consistency-in-distributed-databases/#what-cap-actually-says)),
+and even without one you're trading latency against consistency
+([PACELC](/knowledge-base/consistency-in-distributed-databases/#pacelc-the-half-cap-leaves-out)).
+
+**Prefer the simplest design that meets the requirement.** Complexity is a
+permanent operational tax paid by everyone who maintains the system. A boring
+solution that the on-call engineer understands at 3am beats a clever one they don't.
+
+**Don't distribute prematurely.** Distribution buys scale and independence, and
+costs you network failures, partial failures, distributed debugging, and eventual
+consistency. One well-structured service on a bigger machine is often the right
+answer far longer than architecture diagrams suggest.
+
+**Scale for the load you can justify.** Design so the *next* order of magnitude is
+reachable without a rewrite — but don't build for 100× today's traffic. Over-engineered
+capacity is real cost and real complexity in exchange for a hypothetical.
+
+**Make the common case fast, the rare case correct.** Optimize the hot path;
+accept slower, more careful handling for the exceptional path. Cache what's read
+constantly; don't optimize what runs monthly.
+
+**Prefer idempotent and reversible operations.** Idempotency makes retries safe,
+and retries are unavoidable. Reversibility (feature flags, staged rollouts, quick
+rollback) is what makes shipping safe when you're inevitably wrong.
+
+**Automate the toil.** Any recovery step that depends on a human remembering it
+will fail during the incident when it matters. Health checks, autoscaling, failover,
+and rollback should be mechanical.
+
+## At a glance
+
+| Principle / tenet | The one-liner |
+| --- | --- |
+| **Scalability** | Add resources to handle load; scale out, not just up |
+| **Statelessness** | Interchangeable instances — the enabler for scaling out |
+| **Availability** | Responds when asked; nines multiply across series dependencies |
+| **Reliability** | Responds *correctly*, over time |
+| **Durability** | Committed data survives |
+| **No SPOF** | Any component can die; redundancy prevents, failure domains bound |
+| **Design for failure** | Every call needs a timeout, retry, idempotency, and fallback plan |
+| **Graceful degradation** | Shed the least valuable work; never brown-out everything |
+| **Loose coupling** | Pick sync vs async per boundary; don't share writable state |
+| **Single source of truth** | One authoritative home per fact; everything else derived |
+| **Observability** | Metrics, logs, traces + SLI/SLO/error budget, designed in |
+| **Name the trade** | No property is free — say what you gave up |
+| **Simplicity** | Boring and understood beats clever and opaque |
+| **Don't distribute early** | Distribution buys scale, costs correctness and debuggability |
+
+The unifying idea: **a good design is not the one with the most properties, it's
+the one whose trade-offs match the requirement.** Knowing the principles is table
+stakes; the senior skill is stating plainly which ones you sacrificed, for what,
+and at what point you'd revisit the decision.
