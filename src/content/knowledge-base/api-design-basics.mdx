@@ -1,0 +1,323 @@
+---
+title: 'API Design Basics'
+description: 'The contract an HTTP API makes with its callers — what GET, PUT and POST each promise, how to model resources, and the cross-cutting decisions (status codes, pagination, versioning) that decide whether the API survives contact with real clients.'
+pubDate: 'Aug 1 2026'
+updatedDate: 'Aug 1 2026'
+tags: ['System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+An API is a **contract**, and the thing that makes HTTP APIs different from ordinary
+function calls is that infrastructure you don't control acts on that contract.
+Browsers prefetch. CDNs cache. Client libraries retry. Every one of those behaviours
+is keyed off the verb you chose.
+
+So the verbs come first, and everything else is consequence.
+
+<Aside title="Scope">
+This note covers `GET`, `PUT` and `POST` — the three that carry almost all real
+traffic. `DELETE` and `PATCH` are left out; `DELETE` behaves like `PUT` (idempotent,
+identifier known), and `PATCH` is the awkward one whose semantics depend entirely on
+the patch format you pick.
+
+This is the **contract**. For the **message** — request anatomy, where data belongs,
+headers, encoding — see [Anatomy of an HTTP Request](/knowledge-base/anatomy-of-an-http-request/).
+</Aside>
+
+## The verb contract
+
+Three properties, and every design decision below follows from them:
+
+| Verb | Safe | Idempotent | Cacheable |
+| --- | --- | --- | --- |
+| `GET` | Yes | Yes | **Yes** |
+| `PUT` | No | **Yes** | No |
+| `POST` | No | No | No |
+
+- **Safe** — no side effect the *caller* is responsible for. Logging, analytics and
+  cache warming don't count; nothing changes that a user would mind happening twice.
+- **Idempotent** — repeating the request lands on the same state. Not "returns the
+  same response" — the same *effect*.
+- **Cacheable** — a proxy, CDN or browser may serve a stored copy without asking you.
+
+> These are promises to machines, not notes for humans. Break one and something you
+> don't own does the wrong thing.
+
+## GET — retrieval
+
+> Fetch a representation. Change nothing.
+
+```http
+GET /v1/books/9780571364688
+GET /v1/books?author=ishiguro&limit=20
+```
+
+Because `GET` is safe and idempotent, you get a large amount of free behaviour:
+HTTP caching and [`ETags`](/knowledge-base/anatomy-of-an-http-request/#conditional-requests),
+CDN edge caching, bookmarkable and shareable URLs, browser prefetch, and automatic
+retry on timeout in most client libraries.
+
+That free behaviour is also the trap. A `GET` that mutates state will eventually be
+triggered by something that never intended to:
+
+```text
+GET /books/123/delete        ← a crawler will find this
+                             ← a link prefetcher will fire it
+                             ← a proxy will retry it on timeout
+```
+
+Nothing in your application code is wrong in that scenario. The verb lied, and
+infrastructure believed it. **If it changes state, it is not a `GET`.**
+
+<Aside title="Reads are where caching lives">
+Everything worth caching flows through `GET` — which is why keeping reads on `GET`
+matters beyond correctness. See
+[Caching Strategies and Invalidation](/knowledge-base/caching-strategies-invalidation/)
+for what happens behind the endpoint.
+</Aside>
+
+## PUT — write to a known identifier
+
+> The client knows the identifier and sends the complete resource. Repeating it is
+> harmless.
+
+```http
+PUT /v1/books/9780571364688
+{ "title": "Klara and the Sun", "price": 1299, "stock": 4 }
+```
+
+Two things define `PUT`: **the caller supplies the identity**, and the body is a
+**full replacement** rather than a delta. Together those make it idempotent — send it
+five times and the resource ends up identical to sending it once.
+
+That idempotency is worth engineering *toward*, because it makes retries free:
+
+```text
+PUT /v1/books/{isbn}     → retry safely, no bookkeeping
+POST /v1/books           → retry may create a second book
+```
+
+Whenever the data has a **natural key** — an ISBN, an email address, an account
+number — prefer `PUT` on that key. You get retry safety with no extra machinery,
+which is the [natural idempotency](/knowledge-base/idempotency-retries-backoff/#idempotency-keys)
+path rather than the client-generated-key path.
+
+<Aside title="Partial PUT is the common bug">
+`PUT` replaces. Send `{ "price": 1299 }` to a full-replacement endpoint and a strict
+implementation clears every field you omitted. Either require the whole resource and
+document it, or don't call it `PUT`.
+</Aside>
+
+A full replacement also invites a lost update — two clients each `PUT` a whole
+resource and the later one silently discards the earlier's change. The fix is
+[optimistic concurrency with `If-Match`](/knowledge-base/anatomy-of-an-http-request/#conditional-requests):
+the client echoes the `ETag` it read, and the server rejects the write if the resource
+moved on.
+
+## POST — everything else
+
+> Not a retrieval, and no caller-supplied identity. Repeating it may do the work
+> twice.
+
+`POST` covers three genuinely different jobs, and it's worth knowing which one you're
+doing:
+
+**1. Create where the server assigns the ID.**
+
+```http
+POST /v1/orders
+→ 201 Created
+  Location: /v1/orders/8f3c1a
+```
+
+The response should carry the new resource's location. This is the non-idempotent
+case in its purest form: replay it and you get a second order — which is exactly why
+`POST` is where [idempotency keys](/knowledge-base/idempotency-retries-backoff/#idempotency-keys)
+become necessary rather than optional.
+
+**2. Actions that aren't resource mutations.** Triggering a sync, sending an email,
+re-running a job. There's no noun to `PUT` to, and the operation isn't idempotent, so
+`POST` is correct rather than a compromise.
+
+```http
+POST /v1/books/9780571364688/refresh
+```
+
+**3. Reads whose input won't fit in a URL** — the one real gray area, below.
+
+## Reads that don't fit in a URL
+
+`GET` is right for reads, until the input stops fitting. Three cases force the issue:
+
+- **Size** — no spec limit, but
+  [~2000 characters](/knowledge-base/anatomy-of-an-http-request/#urls-and-encoding) is
+  the safe ceiling across browsers, proxies and server defaults. A 100-item batch or a
+  faceted search blows past it.
+- **Secrecy** — URLs leak into access logs, browser history, `Referer` headers,
+  analytics and CDN logs. A token or an email address in a query string is a real
+  exposure even under TLS.
+- **Structure** — nested filters and boolean expressions don't flatten into query
+  params without inventing an encoding.
+
+A [body on `GET`](/knowledge-base/anatomy-of-an-http-request/#where-data-belongs) is
+not the escape hatch: proxies strip it, some servers ignore it, and the `fetch()`
+spec forbids it. So the convention is a `POST` that performs a read, **named so the
+intent is unmistakable**:
+
+```http
+POST /v1/books:batchGet
+{ "isbns": ["9780571364688", "9780571225408"] }
+```
+
+The trade you're making, explicitly: you give up HTTP caching, `ETag`s, CDN caching
+and shareable URLs, and you buy payload size and secrecy. Worth it for a 100-item
+batch; not worth it for a single-resource read.
+
+<Aside title="Say it out loud">
+A `POST` that reads is a deliberate trade, and stating it is the difference between
+looking pragmatic and looking careless. Where both cases exist, expose a `GET` for
+the simple one and keep `POST` for the complex one.
+</Aside>
+
+Caching doesn't disappear — it moves server-side. Cache **per item**, keyed by
+identifier, and assemble batch responses from those entries. Whole-response caching
+of a batch is nearly useless, because the same item recurs across many different
+batches.
+
+## Choosing between them
+
+Work down the list and stop at the first match:
+
+1. **Retrieving, input fits in a URL, not sensitive** → `GET`
+2. **Retrieving, but the input is large / sensitive / structured** → `POST`, named
+   like a read (`:batchGet`, `/search`)
+3. **Writing, and the caller knows the identifier** → `PUT` (idempotent — prefer this
+   whenever a natural key exists)
+4. **Creating, and the server assigns the identifier** → `POST` + idempotency key
+5. **An action with no resource to mutate** → `POST`
+
+## Resources and naming
+
+> URLs name **things**. Verbs describe what you're doing to them.
+
+```text
+GET  /v1/books/{isbn}          ✓ noun, plural collection
+POST /v1/books/{isbn}/refresh  ✓ action, when there's genuinely no noun
+
+GET  /v1/getBook?id=...        ✗ verb in the path — that's what GET is for
+POST /v1/bookUpdate            ✗ ditto
+```
+
+Plural collections, identifiers in the path, filters in the query string:
+
+```text
+/v1/books                      the collection
+/v1/books/{isbn}               one member
+/v1/books/{isbn}/reviews       a sub-collection that only exists in context
+```
+
+Two modelling rules that matter more than naming:
+
+**Name the owner of every field.** If your service holds both your own price and a
+price mirrored from a third party, those are separate blocks with separate freshness
+guarantees — not one `price` field. Collapsing them is how you end up unable to say
+which number is authoritative. This is
+[single source of truth](/knowledge-base/system-design-principles-tenets/#single-source-of-truth)
+applied to a response body.
+
+**Stop nesting at one level.** `/authors/{id}/books/{isbn}/reviews/{rid}` forces
+callers to know a hierarchy that will change. If a resource has its own identifier,
+give it a top-level route.
+
+## Status codes and errors
+
+Enough codes to be precise, not the whole registry:
+
+| Code | Meaning |
+| --- | --- |
+| `200 OK` | Success with a body |
+| `201 Created` | New resource; include `Location` |
+| `204 No Content` | Success, nothing to return |
+| `400 Bad Request` | Malformed — retrying won't help |
+| `401` / `403` | Not authenticated / not permitted |
+| `404 Not Found` | No such resource |
+| `409 Conflict` | Violates current state (duplicate, version clash) |
+| `422 Unprocessable` | Well-formed but semantically invalid |
+| `429 Too Many Requests` | Throttled — send [`Retry-After`](/knowledge-base/anatomy-of-an-http-request/#headers-worth-knowing) |
+| `500` / `503` | Server fault / temporarily unavailable |
+
+The split that actually matters to callers is **`4xx` means don't retry, `5xx` and
+`429` mean retry with backoff**. Return `400` for a transient fault and clients give
+up on work that would have succeeded; return `500` for malformed input and they retry
+forever. (See
+[retries: when and when not](/knowledge-base/idempotency-retries-backoff/#retries-when-and-when-not).)
+
+Errors need one consistent shape, with a **machine-readable code** alongside the
+human message — clients must not have to string-match your prose:
+
+```json
+{
+  "error": {
+    "code": "isbn_not_found",
+    "message": "No book with ISBN 9780000000000.",
+    "requestId": "req_8f3c1a"
+  }
+}
+```
+
+<Aside title="Partial failure in batch endpoints">
+A batch of 100 where 3 items fail is **not** a `4xx`. Return `200` with per-item
+results keyed **by identifier** (never positionally — that's an off-by-one bug
+waiting to happen), so the caller can tell exactly what succeeded and retry only the
+rest. Also cap the batch size, and rate limit by *items* rather than requests —
+otherwise a batch endpoint is a free traffic multiplier against you.
+</Aside>
+
+## Pagination and filtering
+
+Every collection response must be bounded. An unbounded list endpoint is an
+unbounded-work endpoint, and it will be discovered eventually.
+
+**Cursor-based, not offset-based:**
+
+```http
+GET /v1/books?limit=20&cursor=eyJpZCI6MTIzfQ
+
+{ "items": [ ... ], "nextCursor": "eyJpZCI6MTQzfQ" }
+```
+
+`?offset=200` re-runs the query and skips 200 rows — so if anything was inserted or
+deleted meanwhile, callers **silently skip and duplicate** items across pages, and
+the cost grows with the offset. A cursor encodes *where you were*, which is both
+stable under concurrent writes and cheap.
+
+Filters and sorts belong in the query string, with a documented default and a hard
+maximum on `limit`:
+
+```text
+/v1/books?author=ishiguro&sort=-published&limit=20
+```
+
+## Versioning and evolution
+
+> Assume you cannot see every client, and design so you never have to.
+
+```text
+/v1/books        version in the path — visible, greppable, trivially routable
+```
+
+The version number is the cheap part. The discipline is the rule you commit to:
+
+- **Additive only.** New optional fields and new endpoints are safe.
+- **Never repurpose a field**, never narrow a type, never make an optional field
+  required.
+- **Never change the meaning of an existing value.** Silent semantic changes are
+  worse than breaking changes, because nothing fails loudly.
+
+Anything you can't do additively is `/v2`, running alongside `/v1` until callers move.
+
+Two habits that buy real freedom later: clients must **ignore unknown fields** (so
+you can add them), and where a response mirrors data from elsewhere, **timestamp it**
+(`asOf`) so staleness is part of the contract instead of an assumption.
