@@ -1,0 +1,286 @@
+---
+title: 'REST vs GraphQL vs gRPC'
+description: 'Three ways to expose an API and what each one costs you — resource semantics vs client-specified queries vs binary contracts, what happens to caching and versioning in each, and the failure modes that only show up in production.'
+pubDate: 'Aug 1 2026'
+updatedDate: 'Aug 1 2026'
+tags: ['System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+[API Design Basics](/knowledge-base/api-design-basics/) assumes you've already picked
+REST. This note is the step before that: three API styles, what each one is actually
+optimizing for, and what you give up.
+
+The short version, since it's the part people get wrong: **this is mostly a question
+about who your callers are**, not about which technology is better. REST for public
+and partner APIs, gRPC between your own services, GraphQL when many different clients
+need different shapes of the same data.
+
+<Aside title="They compose">
+This isn't a single choice for a whole system. A very common production shape is a
+GraphQL or REST gateway at the edge, speaking gRPC to the services behind it. Picking
+"one API style for the company" is usually a sign the question was framed wrong.
+</Aside>
+
+## What you're actually choosing between
+
+Four axes. Everything below is a position on these:
+
+1. **Who decides the response shape** — the server (REST, gRPC) or the client
+   (GraphQL)?
+2. **Where the contract lives** — in documentation and convention (REST), or in a
+   machine-readable schema that generates code (GraphQL, gRPC)?
+3. **What you get from HTTP for free** — caching, retries, and proxy behaviour depend
+   on [the verb contract](/knowledge-base/api-design-basics/#the-verb-contract), and
+   two of these three styles opt out of it.
+4. **Who can call it** — anything with an HTTP client, or only callers you can ship a
+   generated stub to?
+
+Axis 3 is the one that surprises people. It's the reason GraphQL and gRPC both need
+you to rebuild caching yourself.
+
+## REST
+
+> Resources named by URL, operations named by HTTP verb. The server decides the
+> representation.
+
+```http
+GET  /v1/books/9780571364688
+GET  /v1/books/9780571364688/reviews?limit=20
+POST /v1/books/9780571364688/refresh
+```
+
+What you get, and it's more than it looks: **HTTP caching and CDN caching work
+without you doing anything**, [conditional requests](/knowledge-base/anatomy-of-an-http-request/#conditional-requests)
+give you cheap revalidation and optimistic concurrency, every client library and proxy
+on earth already speaks it, and it's debuggable with `curl` and readable in a log.
+
+The costs are real and they scale with client diversity:
+
+**Over-fetching and under-fetching.** A mobile list view needs a title and a thumbnail;
+the endpoint returns the full book. The detail view needs the book *plus* reviews *plus*
+the author, so it makes three round trips. Neither is fixable without changing the
+endpoint, and changing it for one client affects all of them.
+
+**Endpoint sprawl.** The usual response to the above is `?fields=`, then `?expand=`,
+then `/books/{isbn}/summary`, then `/mobile/v2/books/{isbn}`. Each is reasonable
+alone; together they're a surface nobody can hold in their head.
+
+The honest summary: REST is the right default, and the pressure to leave it comes
+almost entirely from having many clients with genuinely different data needs.
+
+## GraphQL
+
+> One endpoint, one schema. The client sends a query describing exactly the fields it
+> wants, and gets back that shape.
+
+```graphql
+query {
+  book(isbn: "9780571364688") {
+    title
+    price
+    author { name }
+    reviews(limit: 3) { rating body }
+  }
+}
+```
+
+One round trip, exactly the fields asked for, and the mobile client and the web client
+can ask for different things against the same schema with no server change. That's the
+whole pitch, and for a product with several dissimilar frontends it's a genuine win.
+
+Three structural consequences, all of which you have to plan for:
+
+**Everything is `POST /graphql`.** Same URL, same verb, for every operation.
+[HTTP caching is gone](/knowledge-base/api-design-basics/#reads-that-dont-fit-in-a-url) —
+no CDN, no `ETag`, no browser cache, because nothing distinguishes one request from
+another at the HTTP layer. Caching moves into your resolvers and the client, and it's
+now your problem.
+
+**The N+1 problem is the default behaviour.** Resolvers run per field, per object:
+
+```text
+query { books(limit: 50) { title author { name } } }
+
+  → 1 query for 50 books
+  → 50 queries for 50 authors      ← one per book
+```
+
+The fix is a **batching loader** (DataLoader and equivalents) that collects the
+author IDs requested within one tick and issues a single `IN (...)` query. This isn't
+optional polish — without it a harmless-looking query melts your database.
+
+**A single request has unbounded cost.** Nested fields let a caller ask for something
+quadratic:
+
+```graphql
+query { books { reviews { author { reviews { author { ... } } } } } }
+```
+
+So a public GraphQL endpoint needs **depth limits, complexity scoring, and per-caller
+cost budgets** before it's safe. Rate limiting by request count is meaningless when
+one request can be a thousand times more expensive than another.
+
+<Aside title="Persisted queries buy caching back">
+Register queries server-side by hash, and clients send the hash instead of the query
+text. Now you can serve them over `GET /graphql?id=abc123&vars=...`, which is
+cacheable at the CDN again, and it doubles as an allowlist that eliminates the
+unbounded-cost problem. If you're exposing GraphQL publicly, this is close to
+mandatory.
+</Aside>
+
+Two smaller things worth knowing. GraphQL returns **`200` with an `errors` array**, so
+partial success is native — but it means [status codes](/knowledge-base/api-design-basics/#status-codes-and-errors)
+no longer tell your clients or your monitoring anything, and a dashboard watching
+`5xx` rates will show a flat line through an outage. And GraphQL's answer to
+[versioning](/knowledge-base/api-design-basics/#versioning-and-evolution) is that there
+are no versions: you add fields and deprecate old ones, forever. That's genuinely
+nicer than `/v2` — but "forever" means you need field-level usage analytics to ever
+delete anything.
+
+## gRPC
+
+> Define methods and messages in a `.proto` schema, generate client and server code,
+> send binary over HTTP/2.
+
+```protobuf
+service BookService {
+  rpc GetBook (GetBookRequest) returns (Book);
+  rpc ListBooks (ListBooksRequest) returns (stream Book);
+}
+
+message GetBookRequest {
+  string isbn = 1;
+}
+```
+
+The generated stub means a call looks like a function call in whatever language you're
+in, with types checked at compile time. What you get:
+
+- **Small and fast.** Protobuf is binary, so payloads run maybe 3–10× smaller than the
+  equivalent JSON, and parsing is cheaper. Over HTTP/2 many calls multiplex on one
+  connection instead of queueing.
+- **Streaming is first-class** — server-streaming, client-streaming and bidirectional,
+  not bolted on.
+- **The schema is enforced, not documented.** You cannot accidentally send a field
+  that doesn't exist; a mismatch fails at build time rather than in production.
+- **Deadlines propagate.** A caller's remaining time budget travels with the call, so
+  a service can stop work that its caller has already given up on. This is a real
+  operational advantage over REST, where every hop invents its own timeout.
+
+The costs:
+
+**Browsers can't speak it directly.** Browser JS can't control HTTP/2 framing, so you
+need **gRPC-Web** plus a translating proxy (Envoy, or equivalent), and gRPC-Web drops
+client-streaming and bidirectional streaming. This alone rules gRPC out for most
+public web APIs.
+
+**It's opaque.** No `curl`, no readable payload in a packet capture, no reading a
+request body in a proxy log. You need `grpcurl` and the schema, and tooling for
+partners who don't have either.
+
+**Load balancing needs L7.** gRPC holds one long-lived HTTP/2 connection and multiplexes
+over it, so an L4 load balancer pins a client to one backend forever — new backends get
+no traffic and the load is lopsided. You need a proxy that balances individual requests,
+or client-side load balancing.
+
+<Aside title="Protobuf field numbers are the contract">
+Field *numbers*, not names, are what's on the wire. So renaming a field is free and
+changing its number is a breaking change — the opposite of the intuition JSON gives
+you. Never reuse a number from a deleted field; mark it `reserved`. A recycled field
+number means old clients silently parse new data into the wrong field, which fails
+without erroring.
+</Aside>
+
+gRPC also brings **its own status codes** — `NOT_FOUND`, `INVALID_ARGUMENT`,
+`DEADLINE_EXCEEDED`, `UNAVAILABLE` — and the same retry discipline applies as in HTTP:
+`UNAVAILABLE` and `DEADLINE_EXCEEDED` are
+[retryable, `INVALID_ARGUMENT` is not](/knowledge-base/idempotency-retries-backoff/#retries-when-and-when-not).
+
+## What happens to caching
+
+Worth isolating, because it's the difference that costs the most to discover late:
+
+| | REST | GraphQL | gRPC |
+| --- | --- | --- | --- |
+| CDN / browser cache | Free | None (unless persisted queries) | None |
+| `ETag` / `304` | Free | No | No |
+| Server-side cache | Per resource, easy | Per resolver, per field | Per method, manual |
+
+REST's cacheability comes from `GET` on a distinct URL — a stable key that
+infrastructure you don't own can reason about. Remove either half and you're back to
+building it yourself with [application-level caching](/knowledge-base/caching-strategies-invalidation/).
+
+For an internal service at 3× the read volume, that's fine — you were going to run
+Redis anyway. For a public read-heavy API where a CDN could have absorbed 90% of
+traffic, it's the dominant cost of the decision.
+
+## Choosing between them
+
+Work down the list and stop at the first match:
+
+1. **Public or partner-facing API** → **REST**. Anyone can call it with any tooling,
+   and you get caching for free. The bar for anything else here is very high.
+2. **Service-to-service inside your own network, especially high-volume or
+   latency-sensitive** → **gRPC**. You control both ends, so you can ship stubs, and
+   the schema enforcement and deadline propagation pay off with every service you add.
+3. **Several dissimilar clients (web, iOS, Android, watch) reading overlapping data,
+   and endpoint sprawl is already hurting** → **GraphQL**, with batching loaders and
+   complexity limits from day one.
+4. **Streaming, bidirectional or long-lived** → **gRPC** if both ends are yours;
+   otherwise WebSockets or Server-Sent Events.
+5. **None of the above applies cleanly** → **REST**. It's the choice you'll regret
+   least, and the only one you can walk away from cheaply.
+
+Two anti-patterns to name, since both are common:
+
+**GraphQL for a single frontend.** If one client consumes your API, you've taken on
+resolver caching, N+1 batching, and cost limiting to solve an over-fetching problem
+that a couple of well-shaped REST endpoints would have solved. The complexity is paid
+up front and the benefit arrives with the *second* dissimilar client.
+
+**gRPC for a public API.** Every external caller now needs a proxy, a toolchain, and
+generated stubs to make one request. You've optimized bytes on the wire and made
+adoption the bottleneck.
+
+## Things to keep in mind
+
+Style-independent, and each one is a thing people learn the expensive way:
+
+- **The style doesn't decide the model.** Bad resource boundaries are bad in all three.
+  A GraphQL schema mirroring your database tables leaks your schema to clients exactly
+  the way a REST endpoint doing the same does.
+- **A generated client is not a stable contract.** Protobuf and GraphQL both make
+  *additive* change easy and tempt you into a breaking one. The
+  [additive-only discipline](/knowledge-base/api-design-basics/#versioning-and-evolution)
+  is the same in all three; only the mechanism differs.
+- **Idempotency is yours to provide.** gRPC and GraphQL have no equivalent of `PUT` —
+  nothing in either tells a caller a retry is safe. Say it in the method name or the
+  docs, and use [idempotency keys](/knowledge-base/idempotency-retries-backoff/#idempotency-keys)
+  where the operation can't be naturally idempotent.
+- **Migration is per-endpoint, not per-system.** You can put GraphQL in front of
+  existing REST endpoints, or move one hot internal call to gRPC while everything else
+  stays. Treating this as a rewrite is how it becomes a two-year project.
+
+## At a glance
+
+| | REST | GraphQL | gRPC |
+| --- | --- | --- | --- |
+| **Response shape decided by** | Server | Client | Server |
+| **Transport** | HTTP/1.1+ | HTTP (one `POST`) | HTTP/2 |
+| **Payload** | JSON | JSON | Binary (protobuf) |
+| **Contract** | Convention + docs | Schema (SDL) | Schema (`.proto`) |
+| **HTTP caching** | Free | None | None |
+| **Browser support** | Native | Native | Needs proxy + gRPC-Web |
+| **Streaming** | Awkward | Subscriptions | First-class |
+| **Errors** | Status codes | `200` + `errors` array | gRPC status codes |
+| **Versioning** | `/v1`, `/v2` | Deprecate fields | Field numbers |
+| **Signature failure mode** | Over/under-fetching, sprawl | N+1, unbounded query cost | Opacity, L4 balancing |
+| **Best fit** | Public and partner APIs | Many dissimilar clients | Internal service-to-service |
+
+The model worth keeping: **REST trades payload efficiency for universal reach and free
+caching; GraphQL trades caching and cost-predictability for client flexibility; gRPC
+trades reach and debuggability for speed and an enforced contract.** Decide by naming
+your callers, not by comparing feature lists.
