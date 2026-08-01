@@ -24,6 +24,33 @@ Three content collections (`src/content.config.ts`), all sharing one frontmatter
 Cross-link between sections liberally, and deep-link to specific headings when
 referencing one concept (e.g. `/knowledge-base/solid-principles/#o--openclosed-principle`).
 
+### Design Review posts (`Design Review` tag)
+
+A Blog sub-genre for API/system design walkthroughs, often grown out of interview
+practice. Same inductive arc as any Deep Dive, with a specific shape: state the
+product and its numbers → sketch the *obvious* design honestly → walk the escalating
+places it breaks (one `## Break N:` heading each) → close with the settled endpoint
+surface, an explicit **"What I'd leave out of v1"**, and takeaways phrased as
+transferable reflexes rather than facts about the example.
+
+Two rules that matter more than the structure:
+
+- **Author, don't transcribe.** Practice material is a graded transcript; the post is
+  a single authored voice. Present reasoning as reasoning, not as correction. A
+  mistake may appear where the *reflex* it teaches is the point (e.g. "anything the
+  server can determine about the caller, the server must determine") — sparingly, at
+  most one per post, and in an Aside so it reads as judgment rather than confession.
+- **Be honest about what you skip.** Sections arguing *against* a thing — why almost
+  nothing here is worth caching, what's cut from v1 — carry more weight than another
+  endpoint list. Say what the trade buys.
+
+Reference material belongs in the KB, not inline: deep-link to
+`/knowledge-base/api-design-basics/` and `/knowledge-base/anatomy-of-an-http-request/`
+at specific anchors instead of re-explaining verbs, status codes, or `ETag`s.
+
+There is no `src/pages/tags/` route — tags render as display-only chips, so a new tag
+is just a frontmatter string with no route to add.
+
 ## Writing MDX
 
 Shared components: `import Aside from '../../components/Aside.astro'` and
