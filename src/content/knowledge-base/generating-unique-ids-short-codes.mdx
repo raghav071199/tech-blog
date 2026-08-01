@@ -1,0 +1,284 @@
+---
+title: 'Generating Unique IDs and Short Codes'
+description: 'How to produce identifiers that never collide — keyspace math, random vs hashed vs counter-based schemes, UUIDs, Snowflake IDs, and which to reach for when.'
+pubDate: 'Jul 30 2026'
+updatedDate: 'Jul 30 2026'
+tags: ['System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+Generating identifiers that are guaranteed unique — without a central bottleneck —
+is a problem that shows up everywhere: short codes in a URL shortener, primary keys
+across shards, [idempotency keys](/knowledge-base/idempotency-retries-backoff/#idempotency-keys),
+request and trace IDs, dedup tokens. The approaches are the same each time, and so
+are the trade-offs.
+
+<Aside title="Scope">
+This is about generating **unique identifiers**, where you control the keyspace and
+want no duplicates. It is not about hash functions for lookup or integrity (hash
+tables, checksums, cryptographic collision resistance) — related word, different
+concerns. **Consistent hashing** is also a different problem: that's distributing
+keys across *nodes*, not minting them.
+</Aside>
+
+## What you're actually choosing between
+
+Every scheme below trades along the same five axes. Naming them first is what makes
+the comparison mean anything:
+
+1. **Uniqueness guarantee** — collision-free *by construction*, or merely
+   improbable and checked?
+2. **Coordination cost** — does generating an ID require talking to a shared
+   counter, a database, or another service?
+3. **Length** — how many characters on the wire? Matters when the ID is
+   user-visible.
+4. **Unguessability** — can someone take one ID and derive another valid one? Keep
+   this separate from **metadata leakage** (does the ID reveal *when* it was
+   created?) — an ID can leak time without being enumerable.
+5. **Sortability** — do IDs increase over time? This determines database index
+   locality, which matters more than people expect.
+
+No scheme wins on all five. Pick which ones your problem actually needs.
+
+## Keyspace and collision math
+
+With an alphabet of `k` symbols and length `n`, the keyspace is `k^n`. For
+**base62** (`a–z`, `A–Z`, `0–9`):
+
+| Length | Keyspace (62^n) |
+| --- | --- |
+| 4 | ~14.8 million |
+| 5 | ~916 million |
+| 6 | ~56.8 billion |
+| 7 | ~3.5 trillion |
+
+So if you need 6 billion codes, 6 characters suffice (56.8B) and 5 do not (916M).
+
+The formula worth actually remembering is the **birthday bound**: with random
+selection from a keyspace of size `N`, you should expect your first collision after
+roughly `√N` draws — not `N`.
+
+```text
+N = 62^6 ≈ 56.8 billion
+√N      ≈ 238,000
+
+→ Random 6-char codes start colliding after ~238k IDs,
+  even though the space holds 56.8 billion.
+```
+
+That gap is the single most important intuition here: **"the keyspace is huge" does
+not mean "random values won't collide."** Any random scheme needs either a collision
+check or a keyspace far larger than the birthday bound.
+
+## Random plus collision check
+
+> Generate randomly, check whether it's taken, retry on conflict.
+
+```text
+loop:
+    code = random_base62(6)
+    if claim(code):        # atomic conditional insert
+        return code
+```
+
+Simple, and unguessable for free. Two costs:
+
+- **A read (or conditional write) on every generation** — you cannot mint an ID
+  without touching storage.
+- **It degrades as the space fills.** At 10% occupancy retries are rare; at 50%
+  you retry about half the time; near-full it becomes unusable.
+
+The claim *must* be atomic (a conditional insert or unique constraint). Two
+concurrent generators that both check-then-write will happily produce the same code.
+
+## Hash and truncate
+
+> Hash the input, take the first `n` characters.
+
+```text
+code = base62(sha256(url))[:6]
+```
+
+Tempting because it's stateless and naturally deduplicates — the same input always
+yields the same code. But truncation puts you squarely under the birthday bound:
+truncating to 6 base62 chars means collisions between *different* inputs from about
+238k values onward, so you still need collision detection and a disambiguation
+rule.
+
+That leaves you with all the complexity of the random approach and none of the
+simplicity. **Use it only when you specifically want content-addressed dedup**, and
+even then keep the collision check.
+
+## UUIDs
+
+> 128 bits of identifier, generated locally with no coordination at all.
+
+```text
+v4  f47ac10b-58cc-4372-a567-0e02b2c3d479   (122 random bits)
+v7  01890a5d-ac96-774b-bcce-b302099c8f5e   (timestamp prefix + random)
+```
+
+**UUIDv4** is 122 random bits. The keyspace is so vast (`2^122`) that the birthday
+bound sits around `2^61` — you will never collide in practice, which is why this is
+the only scheme here that needs *no* coordination and *no* collision check.
+
+The costs: **36 characters** (unusable as a user-facing short code), and **no
+ordering**. That second point is a real database problem — random primary keys
+scatter writes across a B-tree index, causing page splits and poor cache locality.
+
+**UUIDv7** fixes the ordering by putting a millisecond timestamp in the high bits.
+IDs sort roughly by creation time, so inserts append to the index instead of
+scattering. If you want a UUID for a database key, prefer v7 over v4.
+
+The timestamp does mean v7 **leaks creation time** — but the remaining ~74 bits are
+still random, so v7 is no more *enumerable* than v4. You cannot walk from one v7 to
+the next. Leaking time is a metadata concern, not an access-control one.
+
+<Aside title="UUIDs are for machines, not URLs">
+UUIDs are the right default for internal identifiers, idempotency keys, and trace
+IDs, where length doesn't matter and zero coordination is worth everything. They are
+the wrong choice for anything a human sees or types.
+</Aside>
+
+## Counters
+
+> Increment a shared number and encode it.
+
+```text
+id = 1_000_000  →  base62  →  "4c92"
+```
+
+**Collision-free by construction** — no check, no probability, no birthday bound.
+Also the shortest possible codes, since the keyspace is used densely from zero
+rather than sparsely at random.
+
+The problem is the shared counter: it's a coordination point and therefore a
+bottleneck and a single point of failure. The standard fix is **leased blocks** —
+each server atomically claims a range and then serves from memory:
+
+```text
+server A leases 1..10,000       → hands out 1, 2, 3, ... locally
+server B leases 10,001..20,000  → hands out 10,001, ... locally
+```
+
+Now the shared counter is touched once per 10,000 IDs instead of once per ID, and a
+crashed server merely wastes the rest of its block. This turns the bottleneck into a
+non-issue while keeping the collision-free guarantee.
+
+The remaining flaw is **guessability**: `4c92` is followed by `4c93`. Sequential IDs
+leak your volume and let anyone enumerate your data.
+
+## Making counters unguessable
+
+The fix is to scramble the counter through a **bijective** (one-to-one) function.
+Because the mapping is reversible, distinct inputs always give distinct outputs —
+so you keep the collision-free guarantee while the output looks random.
+
+The simple version is multiplication by a constant coprime to the keyspace size,
+modulo that size:
+
+```text
+scrambled = (id * PRIME) mod 62^6      # PRIME coprime to 62^6
+code      = base62(scrambled)
+
+1 → "7Kd9Qm"      2 → "bX2vLp"      3 → "R4nZ8w"
+```
+
+Consecutive counter values now produce unrelated-looking codes. (Stronger
+constructions exist — small block ciphers or Feistel networks over the keyspace —
+but the property that matters is just bijectivity.)
+
+This combination — **leased counter blocks plus a bijective scramble** — is the
+standard answer for short codes: collision-free, no read-before-write, minimum
+length, and unguessable.
+
+## Snowflake IDs
+
+> Compose an ID from timestamp + machine ID + per-machine sequence, so uniqueness
+> needs no coordination at generation time.
+
+Originally from Twitter, and now the common pattern for distributed IDs. A 64-bit
+layout:
+
+```text
+┌────────┬──────────────┬────────────┬──────────────┐
+│  1 bit │   41 bits    │  10 bits   │   12 bits    │
+│ unused │  timestamp   │ machine ID │   sequence   │
+│        │     (ms)     │ (1024 max) │  (4096 / ms) │
+└────────┴──────────────┴────────────┴──────────────┘
+```
+
+Uniqueness comes from the composition rather than from luck or a shared counter:
+
+- **Timestamp** differs across milliseconds.
+- **Machine ID** differs across generators within the same millisecond.
+- **Sequence** differs within one machine in the same millisecond (4,096 per ms →
+  ~4M IDs/sec per machine).
+
+Two properties make this the industry default for distributed systems:
+
+1. **No coordination on the hot path.** Each machine mints IDs locally; only the
+   machine ID is assigned once at startup.
+2. **Roughly time-sortable.** The timestamp is in the high bits, so IDs increase
+   over time — giving the index locality UUIDv4 lacks, and making "sort by ID"
+   approximate "sort by creation time."
+
+The trade-offs: it needs **unique machine IDs** (config, or a coordination service
+at startup), it depends on the clock (a backwards clock jump can produce duplicates,
+so implementations refuse to move backwards), and at 64 bits it's still ~11 base62
+characters — shorter than a UUID, longer than a 6-char code.
+
+It's also **partly enumerable**, which is the one place it's weaker than a UUID.
+Outside the timestamp there are only 22 low-entropy bits — a 10-bit machine ID and a
+12-bit sequence, both typically starting near zero — so given one ID you can
+construct plausible neighbours by nudging the timestamp and sequence. Fine for
+internal keys; don't use a raw Snowflake ID as anything resembling a secret or an
+unguessable public handle.
+
+## Which should I use?
+
+Work down this list and stop at the first match:
+
+1. **Internal ID, length irrelevant, want zero coordination** → **UUIDv7** (or v4
+   if ordering genuinely doesn't matter). Nothing to operate, no collision check.
+2. **Distributed IDs across many nodes, want time-ordering** → **Snowflake**. This
+   is the default for primary keys in a sharded system.
+3. **Short user-facing code, and you can run a counter** → **leased counter blocks
+   + bijective scramble**. Shortest possible codes, collision-free.
+4. **Short user-facing code, but you want no counter infrastructure** → **random +
+   atomic collision check**, sized so occupancy stays low (aim well under the
+   birthday bound). Accept the extra write.
+5. **You want the same input to always map to the same ID** → **hash and truncate**,
+   with a collision check retained.
+
+Two things to get right regardless of choice: make the claim **atomic** if your
+scheme can collide, and if IDs are user-visible, keep a **denylist** so generated
+codes can't land on reserved words like `admin` or `api`.
+
+<Aside>
+Read-path performance for ID lookups is a separate concern — see
+[Caching Strategies and Invalidation](/knowledge-base/caching-strategies-invalidation/).
+ID → value mappings are usually immutable, which makes them the easiest thing there
+is to cache.
+</Aside>
+
+## At a glance
+
+| Scheme | Unique by | Coordination | Length | Enumerable | Sortable |
+| --- | --- | --- | --- | --- | --- |
+| **Random + check** | Check | Per ID (storage) | Short | No | No |
+| **Hash + truncate** | Check | Per ID (storage) | Short | If input known | No |
+| **UUIDv4** | Probability | None | 36 chars | No | No |
+| **UUIDv7** | Probability | None | 36 chars | No (leaks time) | Yes |
+| **Counter** | Construction | Leased blocks | Shortest | **Yes** | Yes |
+| **Counter + scramble** | Construction | Leased blocks | Shortest | No | No |
+| **Snowflake** | Construction | Machine ID only | ~11 chars | Partly | Yes |
+
+The model worth keeping: **either your IDs are collision-free by construction, or
+you are relying on probability and must check.** Counters and Snowflake buy the
+guarantee with a little coordination; random and UUID buy freedom from coordination
+with a keyspace big enough that the birthday bound stops mattering. Everything else
+on the list — length, guessability, sortability — is a secondary consequence of that
+first choice.
