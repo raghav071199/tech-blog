@@ -1,0 +1,487 @@
+---
+title: 'Designing an Expense API: Where the Obvious Design Breaks'
+description: 'An expense reporting API looks like CRUD until OCR starts writing to the same fields your users do. A design review that starts from the obvious endpoint list and follows it until it breaks — then rebuilds around the question of who owns each field.'
+pubDate: 'Aug 1 2026'
+heroImage: '../../assets/7015995.jpg'
+tags: ['API Contracts', 'System Design', 'Design Review']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+import Mermaid from '../../components/Mermaid.astro';
+
+Expense reporting looks like the most solved problem in software. Employees submit
+expenses, managers approve them, finance exports them. It's CRUD with a workflow
+bolted on, and you could sketch the endpoints in about ninety seconds.
+
+I tried that, and the sketch was wrong in a way I didn't expect. Not wrong on scale —
+the traffic here is unremarkable. Wrong because of a single detail in the
+requirements: **receipts are run through OCR, which populates the same fields the
+user types into.** Two writers, one set of fields, one of them a machine that's
+usually right and occasionally confidently wrong. And because this is financial
+data, someone will eventually need to know which of them wrote the number.
+
+That one detail invalidates most of the obvious design. This post walks the obvious
+design, follows it until it breaks, and rebuilds it around the question it forces:
+*who owns each field?*
+
+## The product
+
+**Ledgerline** is a multi-tenant expense product sold to companies. The shape of it:
+
+- An **expense** has an amount, currency, date, merchant, category, a note, and zero
+  or more receipt images.
+- Receipts go through **OCR**, which takes 2–15 seconds and suggests an amount, date,
+  and merchant. It can also fail, or return low-confidence garbage.
+- Expenses group into a **report**, which an employee submits as a unit.
+- Reports move through a workflow: managers approve their direct reports'
+  submissions, finance exports approved reports to an accounting system.
+
+The numbers that matter for design decisions:
+
+| | |
+| --- | --- |
+| Tenants | 5,000 companies, 1M employees |
+| Volume | ~10M expenses/month, ~10M receipt images at ~2 MB each |
+| Read:write | ~15:1 — write-heavy for a web product |
+| Peak | Month-end close, days 28–31, roughly 20× normal writes |
+
+Two things stand out. **60 requests per second is not a scaling problem** — this is a
+laptop-sized workload. But **20 TB per month of image payload** is a real constraint,
+and a workflow with five states and three actors is a real correctness problem. The
+interesting pressure is in the contract, not the capacity.
+
+## The obvious design
+
+Here's the ninety-second version. It's a reasonable first draft and I want to be fair
+to it, because most of it survives:
+
+```text
+GET    /v1/reports
+GET    /v1/reports/{id}
+POST   /v1/reports
+PATCH  /v1/reports/{id}
+
+GET    /v1/expenses
+GET    /v1/expenses/{id}
+POST   /v1/expenses
+PATCH  /v1/expenses/{id}
+DELETE /v1/expenses/{id}
+```
+
+With an expense that looks like the obvious database row:
+
+```json
+{
+  "expenseId": "ex_8f3c1a",
+  "amount": 42.50,
+  "currency": "GBP",
+  "date": "2026-07-28",
+  "merchant": "Pret A Manger",
+  "category": "meals",
+  "note": "client lunch",
+  "receipts": ["https://storage.example.com/rc_4a91.jpg"]
+}
+```
+
+Nouns in the paths, `PATCH` for partial updates, `POST` to create. Nothing here
+violates the
+[basics](/knowledge-base/api-design-basics/) — and that's exactly why it's worth
+examining. The design isn't sloppy. It's just built on an assumption that doesn't
+hold.
+
+## Break 1: validation is at the wrong boundary
+
+The first crack shows up with a question that sounds like product trivia: **is there
+autosave?**
+
+There has to be. A user photographs a receipt in the back of a taxi, types in half
+the merchant name, and loses signal. That work cannot evaporate. So the client is
+autosaving on every field blur, and the server receives a stream of one-field
+`PATCH`es.
+
+Which means `POST /v1/expenses` has to accept an almost entirely empty object. No
+amount, no date, no merchant, possibly no receipt. And now `400 Bad Request` on a
+create is *wrong* — the incomplete expense isn't a client error, it's the normal
+state of an expense that's three seconds old.
+
+The resolution is that there isn't one validation rule, there are two:
+
+| State | Validation |
+| --- | --- |
+| Draft | Almost everything optional |
+| Submitted | Amount, currency, date, category required; policy rules apply |
+
+**Validation belongs on the transition, not on the write.** That's the first real
+insight, and it has a shape consequence: the interesting error isn't a `400` on
+`PATCH`, it's a `422` on submit that has to itemize *which* expenses are incomplete,
+because the user has to go fix them:
+
+```json
+422 Unprocessable Content
+{
+  "error": {
+    "code": "report_incomplete",
+    "message": "3 expenses need attention before this report can be submitted.",
+    "details": [
+      { "expenseId": "ex_8f3c", "code": "missing_amount" },
+      { "expenseId": "ex_4a91", "code": "receipt_required_above_threshold",
+        "threshold": 2500 }
+    ]
+  }
+}
+```
+
+<Aside title="Autosave changes your traffic model too">
+'10M expenses per month' is the count of expenses, not of writes. With autosave,
+each one absorbs many `PATCH`es before it's ever submitted. The read:write ratio of
+15:1 is already unusual for a web product; autosave is why.
+</Aside>
+
+This is also the one place in this design where `PATCH` genuinely earns its keep over
+`PUT`. The client knows the field that just changed and nothing else — a full
+replacement would mean shipping the whole object on every keystroke pause, and would
+race with itself.
+
+## Break 2: the API can't answer who wrote this
+
+Now the detail that breaks the model rather than the endpoints.
+
+A user uploads a receipt. OCR is queued. Two seconds later, impatient, the user types
+the amount in manually. Six seconds after that, OCR comes back with a different
+number.
+
+<Mermaid chart={`
+sequenceDiagram
+    participant U as User
+    participant API
+    participant OCR as OCR worker
+    U->>API: POST /v1/expenses + receipt
+    API->>OCR: enqueue job
+    U->>API: PATCH amount = 42.50
+    OCR-->>API: amount = 4.25, confidence 0.62
+    Note over API: Which value survives?
+`} />
+
+Last-write-wins gives you £4.25, because OCR wrote last. That's a decimal-point
+misread on an expense claim — a wrong number on a financial record that a human had
+already corrected. The user's careful typing is silently discarded.
+
+So the rule has to be **asymmetric**:
+
+> A user's value may overwrite an OCR value. An OCR value may never overwrite a
+> user's.
+
+Which means the API has to know, per field, where the current value came from. Not
+per record — per *field*, because one expense routinely has a user-typed amount, an
+OCR-derived merchant, and a user-chosen category.
+
+```json
+{
+  "amount": 42.50,
+  "amountSource": "user",
+  "merchant": "Pret A Manger",
+  "merchantSource": "ocr",
+  "category": "meals",
+  "categorySource": "user"
+}
+```
+
+This is the field-ownership question, and it isn't only a conflict-resolution
+mechanism. It's **data the manager needs**: "was this amount verified by a person, or
+is it a machine's guess?" is a real question to ask of a £4,000 expense claim, and
+without per-field provenance the API simply cannot answer it.
+
+<Aside title="The version I got wrong first">
+My first pass had the client send the provenance:
+`PATCH /v1/expenses/{id} { "amount": 42.50, "filledBy": "user" }`.
+
+That's the same class of bug as accepting a `userId` in a request body. A client can
+claim a user verified a value the machine guessed — on the one field that most needs
+to be tamper-proof. **Anything the server can determine about the caller, the server
+must determine.** Provenance comes from the calling credential: a user's bearer token
+stamps `user`, the OCR worker's service credential stamps `ocr`. It is never an
+input.
+</Aside>
+
+## Break 3: OCR shouldn't write to the value fields at all
+
+Provenance tracking makes the conflict *resolvable*. It doesn't make it
+*preventable* — and there's a better move available.
+
+The deeper problem is that `amount` is being asked to mean two different things: the
+value of the expense, and OCR's guess at the value of the expense. Collapse those and
+every read has to reason about which one it's looking at.
+
+Split them. OCR writes **suggestions**, attached to the receipt that produced them.
+Values are written only by users:
+
+```json
+{
+  "amount": null,
+  "amountSource": null,
+  "receipts": [
+    {
+      "receiptId": "rc_4a91",
+      "ocrStatus": "completed",
+      "ocrSuggestions": {
+        "amount":   { "value": 42.50, "confidence": 0.97 },
+        "merchant": { "value": "Pret A Manger", "confidence": 0.71 },
+        "date":     { "value": "2026-07-28", "confidence": 0.94 }
+      }
+    }
+  ]
+}
+```
+
+Three things fall out of this, all of them good.
+
+**The rule becomes structural rather than remembered.** OCR literally cannot
+overwrite a user value, because it has no write path to `amount`. That's better than
+a permission check somebody can forget to apply in a new code path.
+
+**Confidence becomes actionable.** A 0.97 amount can be prefilled in the UI. A 0.71
+merchant should sit *beside* an empty field as a suggestion the user taps to accept.
+Same payload, and the client decides — which is right, because the threshold is a
+product decision that will change without an API version bump. Note also that the
+threshold should differ per field: a wrong merchant is a shrug, a wrong amount is an
+incorrect financial record.
+
+**`ocrStatus` answers a question the client actually has.** With bare URL strings
+there was no way to distinguish "OCR is still running" from "OCR found nothing" — the
+client just saw empty fields. Now it can poll `GET /v1/expenses/{id}` and show a
+spinner until `ocrStatus` leaves `pending`, and show a clean "couldn't read this
+receipt, please enter it manually" on `failed`.
+
+That last point matters more than it looks: **OCR is an assist, never a gate.** A
+failed OCR must degrade to the user typing it in, not to an expense that can't be
+created. Plenty of legitimate expenses have no receipt at all — mileage, cash tips,
+per diem.
+
+## Receipts: 20 TB doesn't belong in your API
+
+10M images a month at 2 MB each is 20 TB of payload. Routing that through the
+application tier is the single most expensive mistake available in this design: your
+API servers spend their lives as a proxy, request timeouts have to accommodate
+cellular uploads, and a retried 2 MB upload costs you the whole 2 MB again.
+
+Clients upload **directly to object storage**, and only a reference reaches your API:
+
+<Mermaid chart={`
+flowchart LR
+    C[Client] -->|1. request upload target| A[API]
+    A -->|2. presigned PUT URL| C
+    C -->|3. upload bytes| S[(Object storage)]
+    C -->|4. register receiptId| A
+    A -->|5. enqueue| O[OCR worker]
+`} />
+
+```text
+POST /v1/uploads                      → { uploadUrl, receiptId }
+PUT  <uploadUrl>                      → bytes go straight to storage
+POST /v1/expenses/{id}/receipts       → { receiptId }  registers it
+```
+
+Two details that are easy to get wrong.
+
+**The API still owns authorization.** It's tempting to say "storage handles access
+control" — it doesn't. Object storage has no idea who manages whom, or who's in the
+finance role for tenant 4,412. Your API evaluates permission and *then* mints a
+short-lived URL scoped to one object. Storage's only job is being unreachable without
+one.
+
+**Don't store the presigned URL.** It expires, so a URL persisted in
+`receipts[].url` is a time bomb that works in testing and 404s a week later. Store
+`receiptId`; sign a fresh URL on every read.
+
+Because the client controls `receiptId` before uploading, a mid-upload retry
+overwrites the same object rather than creating a second receipt — the upload is
+idempotent by construction, which matters when your clients are on cellular and
+[will retry](/knowledge-base/idempotency-retries-backoff/).
+
+## Transitions aren't updates
+
+The workflow has five states and four transitions:
+
+<Mermaid chart={`
+stateDiagram-v2
+    [*] --> draft
+    draft --> submitted: submit
+    submitted --> draft: withdraw
+    submitted --> approved: approve
+    submitted --> rejected: reject
+    rejected --> draft: edit, resubmit
+    approved --> exported: export
+`} />
+
+The tempting shape is `PATCH /v1/reports/{id} { "status": "approved" }`. Resist it:
+it makes the client drive a state machine it doesn't own, it can't express the
+mandatory rejection comment, and it gives you no natural place to return what the
+transition actually did.
+
+Named actions instead:
+
+```text
+POST /v1/reports/{id}/submit      → 422 with itemized failures if incomplete
+POST /v1/reports/{id}/approve     { comment?: string }
+POST /v1/reports/{id}/reject      { comment: string }   → 422 if absent
+POST /v1/reports/{id}/withdraw    submitted → draft
+```
+
+`POST` for all four, guarded by the state machine — approving an already-approved
+report is `409 invalid_transition`, not a second approval. The state check is also
+what makes these safe to retry: the second identical approve request can't
+double-approve, because the state it requires no longer exists. That's
+[natural idempotency](/knowledge-base/idempotency-retries-backoff/#idempotency-keys),
+and it's cheaper than issuing idempotency keys for transitions.
+
+Two states in that diagram are worth calling out, because they're the ones people
+skip:
+
+**`rejected` must be editable.** The entire point of rejection is that the employee
+fixes something and resubmits. A design that freezes reports on rejection has broken
+its own workflow.
+
+**`withdraw` has to exist** if submitted reports are frozen. Otherwise an employee who
+spots a typo one second after submitting has to ask their manager to reject the
+report first.
+
+And the constraint that pushes hardest on the model: once a report is `exported`, its
+expenses are in an external accounting system. The requirement is that they must not
+change *silently* — which is not the same as must not change. Real finance products
+allow corrections, as an **amendment** that creates a new versioned record with a
+reversing entry. That's `POST /v1/expenses/{id}/amendments`, never an in-place
+`PATCH`.
+
+<Aside title="One state machine, not two">
+It's tempting to give `Expense` its own status field alongside the report's. Don't —
+two state machines will disagree. Editability is *derived*: an expense is editable if
+its parent report is in `draft` or `rejected`. One source of truth, in one place.
+</Aside>
+
+## Tenant isolation
+
+5,000 companies on one API, where one company seeing another's expenses is a
+business-ending incident. The structural answer is to never accept identity as input:
+
+```text
+GET /v1/reports?mine=true            ← scoped by the token, not by a body field
+GET /v1/me/reports                   ← or encode it in the path
+```
+
+The tenant comes out of the bearer token's claims, and every query is scoped by it at
+the data-access layer rather than in each handler. A check that each endpoint has to
+remember is a check that a new endpoint will eventually forget.
+
+One deliberate choice worth stating: **cross-tenant access returns `404`, not
+`403`.** A `403` confirms the resource exists, which turns your API into an oracle for
+enumerating other companies' report IDs. Reserve `403` for "this is in your tenant,
+but you're not the manager who can approve it."
+
+## What I'd cache: almost nothing
+
+This is where the reflex to reach for a cache should be resisted, and it's worth
+saying why rather than just skipping the section.
+
+A cache pays off when reads vastly outnumber writes and many readers want the same
+value. Neither holds here. The read:write ratio is 15:1 rather than 100:1, and more
+importantly **every read is private to one user**. There is no hot key: nobody else
+wants your August expense report. A shared cache would hold 1M single-reader entries,
+each one invalidated by the next autosave keystroke.
+
+So the honest answer is that the [caching strategies](/knowledge-base/caching-strategies-invalidation/)
+worth deploying here are narrow:
+
+| Data | Cacheable? |
+| --- | --- |
+| Expenses, reports | No — private, and mutating constantly |
+| Category lists, policy rules, tenant config | Yes — small, shared, slow-changing |
+| Receipt images | Yes, at the CDN, keyed by the signed URL |
+
+Everything user-owned gets `Cache-Control: private, no-store`. What's worth doing
+instead is `ETag` plus `If-Match` on expense `PATCH` — autosave from a phone and a
+laptop on the same draft is a lost-update race, and
+[conditional requests](/knowledge-base/anatomy-of-an-http-request/#conditional-requests)
+are the fix. `412 Precondition Failed` tells the second device to reload rather than
+silently clobber.
+
+## The surface it settles into
+
+```text
+POST   /v1/reports                              → 201
+GET    /v1/reports?status=&from=&to=&limit=&cursor=
+GET    /v1/reports?awaitingMyApproval=true      manager queue
+GET    /v1/reports/{id}?expand=expenses         avoid N+1 on the expense list
+PATCH  /v1/reports/{id}                         name only; totals are derived
+DELETE /v1/reports/{id}                         draft or rejected only
+
+POST   /v1/reports/{id}/submit
+POST   /v1/reports/{id}/approve                 { comment? }
+POST   /v1/reports/{id}/reject                  { comment }
+POST   /v1/reports/{id}/withdraw
+
+POST   /v1/expenses                             Idempotency-Key → 201
+GET    /v1/expenses/{id}                        poll here for ocrStatus
+PATCH  /v1/expenses/{id}                        autosave; If-Match; provenance derived
+DELETE /v1/expenses/{id}
+POST   /v1/reports/{id}/expenses:batchRemove    { expenseIds }
+
+POST   /v1/uploads                              mint a presigned target
+POST   /v1/expenses/{id}/receipts               register an uploaded object
+```
+
+Two things about this list that only make sense in light of the walk above.
+
+**Report totals are derived, not stored.** `amount` on a report is the sum of its
+expenses, so a client `PATCH` to it is rejected rather than honoured. And a single
+`currency` on a report is wrong for a product sold to 5,000 companies — one trip
+generates expenses in three currencies, so you need per-currency subtotals, or a base
+currency plus the FX rate and the date it was taken. "Which rate, as of when" is a
+finance question with audit consequences, not an implementation detail.
+
+**`batchRemove` exists alongside single `DELETE`.** A user multi-selecting five line
+items shouldn't produce five round trips, five recomputes of the report total, and no
+coherent answer when three succeed. It returns `200` with per-item results, because
+[partial failure isn't a `4xx`](/knowledge-base/api-design-basics/#status-codes-and-errors).
+
+## What I'd leave out of v1
+
+Scoping is part of the design, so: no amendments after export (correct the accounting
+system manually until someone asks), no receipt-level line-item splitting, no
+multi-currency FX beyond storing the rate, no webhooks for integrations — polling
+with an `updatedSince` watermark first, webhooks when a customer asks.
+
+The one I'd argue about is **unfiled expenses**. I initially required every expense to
+belong to a report, which is a clean invariant and makes deletion unambiguous. But it
+costs you the quick-capture flow: photograph a receipt in a taxi now, decide which
+report it belongs to at month-end. Capture takes five seconds, filing takes twenty
+minutes, and they happen on different days. An implicit per-user "Unfiled" report gets
+you the invariant *and* the flow, which is probably where I'd land.
+
+## Takeaways
+
+**Field ownership is the first question, not a detail.** The moment two writers share
+a field — a user and a machine, your service and a third party, a human and a batch
+job — you need to know per field who wrote the current value, and you need a rule for
+who wins. Everything else in this design followed from answering that.
+
+**Prefer structural guarantees to remembered ones.** OCR can't overwrite a user's
+amount because it has no write path to that field — not because a check rejects it.
+Provenance is derived from the credential, not accepted from the body. The tenant
+scope lives in the data layer, not in each handler. Every one of those is a rule that
+a new code path cannot accidentally skip.
+
+**Validation belongs on transitions, not on writes.** Autosave forces loose drafts, so
+the strictness has to live somewhere — and putting it on `submit` gives you one place
+to enforce policy and one clear error payload, instead of a contract that can't
+represent a half-finished expense.
+
+**Decide what to cache by asking who else wants the value.** Nobody else wants your
+expense report. That single observation kills most of the caching design a reflex
+would produce, and redirects the effort to `If-Match`, which is what this workload
+actually needed.
+
+The endpoint list at the end of this post isn't very different from the ninety-second
+sketch. Four extra transition endpoints, a split between values and suggestions, and
+receipts that are objects rather than strings. What changed wasn't the surface area —
+it was knowing which of those choices were load-bearing.
