@@ -1,0 +1,183 @@
+---
+title: 'Anatomy of an HTTP Request'
+description: 'What is actually on the wire — request and response structure, where data belongs (path, query, body, headers), the headers worth knowing, and how conditional requests give you caching for free.'
+pubDate: 'Aug 1 2026'
+updatedDate: 'Aug 1 2026'
+tags: ['System Design', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+[API Design Basics](/knowledge-base/api-design-basics/) covers the *contract* — what
+you promise callers. This is the *message*: what's on the wire, and where things
+belong when you're reading a failing request rather than designing an endpoint.
+
+## Structure
+
+A request is a start line, headers, a blank line, and an optional body:
+
+```http
+POST /v1/books?fields=price HTTP/1.1     ← method, target, version
+Host: api.bookstore.com                  ← headers
+Authorization: Bearer eyJhbGc...
+Content-Type: application/json
+Content-Length: 42
+                                         ← blank line
+{ "isbn": "9780571364688" }              ← body
+```
+
+The response is the same shape with a status line in place of the start line:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+ETag: "a3f91c"
+
+{ "title": "Klara and the Sun" }
+```
+
+That's the whole protocol at this level. Everything below is about which part data
+goes in.
+
+## Where data belongs
+
+Four locations, four distinct jobs:
+
+| Location | Carries | Example |
+| --- | --- | --- |
+| **Path** | Identity | `/v1/books/9780571364688` |
+| **Query** | Parameters that modify a retrieval | `?author=ishiguro&limit=20` |
+| **Body** | The payload | `{ "price": 1299 }` |
+| **Headers** | Metadata *about* the request | `Authorization`, `Content-Type` |
+
+Two rules that follow:
+
+**Headers are metadata, never business parameters.** A filter or an ID in a custom
+header is a design smell — headers have practical size limits (often ~8KB total),
+they're awkward to inspect, and proxies may drop or rewrite ones they don't
+recognize.
+
+**`GET` cannot use a body.** Not a convention — proxies strip it, some servers ignore
+it, and the `fetch()` spec forbids it. This is exactly why an oversized read
+[has to become a POST](/knowledge-base/api-design-basics/#reads-that-dont-fit-in-a-url).
+
+<Aside title="POST still uses the URL">
+Adding a body doesn't mean abandoning the path and query.
+`POST /v1/books/{isbn}/refresh?force=true` identifies the book in the path and takes
+a flag in the query — the body is an *addition*, not a replacement.
+</Aside>
+
+## URLs and encoding
+
+```text
+https://api.bookstore.com/v1/books?author=ishiguro&limit=20#reviews
+└─┬──┘ └────────┬───────┘└───┬────┘└──────────┬───────────┘└──┬───┘
+scheme        host          path            query          fragment
+```
+
+Three things worth knowing:
+
+- **The fragment never reaches the server.** It's client-side only, so it can't be
+  used for routing or filtering.
+- **Percent-encode anything reserved.** `?`, `&`, `=`, `#`, `/`, space and non-ASCII
+  must be encoded in values — an unencoded `&` silently splits one parameter into
+  two.
+- **~2000 characters is the safe practical ceiling.** No spec limit, but browsers,
+  proxies and server defaults start failing beyond it.
+
+## Headers worth knowing
+
+Grouped by job, which is easier to remember than an alphabetical list:
+
+| Job | Headers |
+| --- | --- |
+| **Auth** | `Authorization: Bearer <token>` |
+| **Content negotiation** | `Content-Type` (what I'm sending), `Accept` (what I want back) |
+| **Caching** | `Cache-Control`, `ETag`, `If-None-Match`, `Last-Modified` |
+| **Throttling** | `Retry-After` (on `429`/`503`), `X-RateLimit-*` |
+| **Correlation** | `X-Request-Id`, `traceparent` |
+| **Idempotency** | `Idempotency-Key` |
+
+`Content-Type` versus `Accept` is the pair people mix up: `Content-Type` describes
+the body you're sending, `Accept` states the format you want in return.
+
+`Idempotency-Key` is the interesting one — it's a header rather than a body field
+because it's metadata about the *delivery attempt*, not about the operation. The
+[same key must persist across retries](/knowledge-base/idempotency-retries-backoff/#idempotency-keys)
+even when nothing else does.
+
+## Bodies and content types
+
+| Type | Use |
+| --- | --- |
+| `application/json` | The default for APIs |
+| `application/x-www-form-urlencoded` | HTML form posts; flat key-value only |
+| `multipart/form-data` | File uploads, or files mixed with fields |
+
+Always send `Content-Type`. A JSON body without it is at the mercy of whatever the
+server guesses, and the failure — a parse error on a request that looks correct — is
+disproportionately annoying to debug.
+
+## Conditional requests
+
+This is the caching you get for free from `GET`, and it happens at the HTTP layer
+rather than in your application.
+
+The server tags a response with a **validator**; the client sends it back and the
+server answers "unchanged" without resending the body:
+
+```http
+GET /v1/books/9780571364688
+→ 200 OK
+  ETag: "a3f91c"
+  { ...full body... }
+
+GET /v1/books/9780571364688
+  If-None-Match: "a3f91c"
+→ 304 Not Modified          ← no body; the client reuses its copy
+```
+
+`Last-Modified` / `If-Modified-Since` does the same thing with a timestamp, at
+one-second granularity. Prefer `ETag`.
+
+**`Cache-Control` is the other half** — it says whether to revalidate at all:
+
+```text
+Cache-Control: max-age=300        cache for 5 minutes, no revalidation needed
+Cache-Control: no-cache           may cache, but must revalidate every time
+Cache-Control: no-store           never store this (auth responses, PII)
+Cache-Control: private            only the end client, never a shared CDN
+```
+
+<Aside title="The same validator gives you optimistic concurrency">
+Send the `ETag` back as `If-Match` on a write and the server rejects it with `412
+Precondition Failed` if the resource changed meanwhile. That's lost-update
+protection with no locking — the client proves it edited the version it actually
+read.
+</Aside>
+
+This layer is distinct from
+[server-side caching](/knowledge-base/caching-strategies-invalidation/): conditional
+requests stop you *re-sending* data the client already has, while a cache stops you
+*re-computing* it.
+
+## At a glance
+
+| Concept | The one-liner |
+| --- | --- |
+| **Request shape** | Start line, headers, blank line, optional body |
+| **Path** | Identity |
+| **Query** | Retrieval parameters — filters, sorting, pagination |
+| **Body** | Payload; unavailable on `GET` |
+| **Headers** | Metadata only, never business parameters |
+| **Fragment** | Client-side only; never sent to the server |
+| **URL length** | ~2000 chars is the safe ceiling |
+| **`Content-Type` vs `Accept`** | What I'm sending vs what I want back |
+| **`ETag` + `If-None-Match`** | `304 Not Modified` — revalidate without resending |
+| **`Cache-Control`** | Whether and where a response may be stored |
+| **`If-Match` → `412`** | Optimistic concurrency without locks |
+| **`Retry-After`** | The server tells you when to come back; honour it |
+
+The model worth keeping: **path and query address, body carries, headers describe.**
+Most HTTP confusion is something in the wrong one of those four.
