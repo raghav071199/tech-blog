@@ -1,0 +1,318 @@
+---
+title: 'Choosing a Database'
+description: 'How to pick a datastore and defend the choice — what Postgres, MySQL, DynamoDB, MongoDB, Redis, S3 and the specialist stores each actually give you, the access-pattern questions that decide it, and the popular answers worth rejecting out loud.'
+pubDate: 'Aug 2 2026'
+updatedDate: 'Aug 2 2026'
+tags: ['System Design', 'Databases', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+"Which database?" is the question most likely to be asked in a system design
+interview and least likely to be answered well, because the honest answer for most
+problems is boring and the interesting-sounding answers are usually wrong.
+
+This note is a decision procedure. The goal isn't to know facts about datastores —
+it's to be able to name a choice, justify it from the access pattern, and **reject a
+popular alternative out loud with a specific reason**. That last part is what
+separates a defensible answer from a lucky one.
+
+<Aside title="The one-sentence version">
+**Relational unless something specific rules it out.** Postgres handles most problems
+at most scales, and the burden of proof sits with whoever wants something else. This
+is not a conservative cop-out — it's the answer a staff engineer gives, because the
+cost of a wrong NoSQL choice is a rewrite and the cost of a wrong Postgres choice is
+usually an index.
+</Aside>
+
+## Ask these five questions first
+
+Naming the questions before the products is what makes the choice arguable rather
+than a preference:
+
+1. **What are the access patterns?** Not "what's the data" — *how is it read*.
+   Point lookups by key? Range scans? Ad-hoc filters on arbitrary columns? Joins
+   across four entities? This decides more than everything else combined.
+2. **Do multiple records have to change together?** If money moves, inventory
+   decrements, or a booking claims a seat, you need
+   [transactions](/knowledge-base/database-transactions-acid/#atomicity) — and that
+   narrows the field immediately.
+3. **What's the read and write volume, and the shape of it?** Compute it, don't
+   assert it. "Read heavy" is not a number, and the number frequently reveals that
+   scale isn't your constraint at all.
+4. **How big is the data, and what kind?** A 5 MB video and a 200-byte user row do
+   not belong in the same system.
+5. **What consistency does the product actually require?** "Users must see their own
+   write immediately" and "the global count may lag a second" are different systems.
+   This is the [CAP/PACELC](/knowledge-base/consistency-in-distributed-databases/#cp-vs-ap-in-practice)
+   decision, made at the product level rather than the database level.
+
+If you can answer these five, the database follows. If you can't, no amount of
+product knowledge will save the answer.
+
+<Aside title="ACID vs BASE, and SQL vs NoSQL, are stale framings">
+Both once tracked a real divide; they no longer do. MongoDB has had full
+[ACID](/knowledge-base/database-transactions-acid/#acid-one-property-at-a-time)
+transactions since 4.0 and DynamoDB has `TransactWriteItems`, so "I need transactions"
+eliminates nothing.
+
+What still separates them: transactions are **free and unlimited** in Postgres but
+capped at 100 items and billed double in DynamoDB — and only a relational engine
+enforces `FOREIGN KEY`, `CHECK` and `UNIQUE` regardless of which service writes. So
+**the relational advantage isn't ACID any more, it's declarative integrity and ad-hoc
+query flexibility.**
+</Aside>
+
+## The stores, and what each actually buys you
+
+### PostgreSQL
+
+> The default. Relational, full ACID, and far more capable than its reputation.
+
+Reach for it when you have **entities with relationships**, need **joins or ad-hoc
+queries**, or want **constraints enforced by the engine**. It also absorbs a
+surprising amount of what people reach for other tools to do: `JSONB` with GIN indexes
+for schemaless documents, `PostGIS` for geospatial, full-text search, `LISTEN/NOTIFY`
+for lightweight pub/sub, and `pgvector` for embeddings.
+
+The practical ceiling: **writes go to one primary.** You scale reads with replicas
+easily, and writes vertically until you shard — which is manual and genuinely painful
+(or managed, via Citus/Aurora/Vitess-style tooling). "One primary" sounds limiting
+until you notice a well-provisioned Postgres box handles **tens of thousands of writes
+per second**, which is more than most systems in most interviews will ever need.
+
+**Say this out loud when you pick it:** a single primary is a
+[single point of failure](/knowledge-base/system-design-principles-tenets/#no-single-point-of-failure)
+unless you have automated failover to a synchronous standby. Naming the weakness
+before the interviewer does is most of the credit.
+
+**MySQL** is close enough that the choice rarely matters — Postgres has richer types
+and indexes, MySQL has simpler replication. Pick either, justify it in one clause, and
+move on; spending interview time here signals you don't know what the real decisions
+are.
+
+### DynamoDB
+
+> A distributed key-value / wide-column store. Predictable single-digit-millisecond
+> lookups at any scale, in exchange for having to know your queries up front.
+
+The trade is stark and worth stating plainly: **DynamoDB is fast and horizontally
+unbounded because it refuses to do anything it can't do in O(1).** No joins, no ad-hoc
+filters, no "just add a `WHERE` clause" — you design the key schema around the access
+patterns you enumerated in question 1, and a query you didn't plan for requires a new
+index or a full table scan.
+
+```
+partition key → which physical partition
+sort key      → ordering + range queries within that partition
+```
+
+Reach for it when access is **overwhelmingly by known key**, volume is genuinely
+large or spiky, and you want operations to be someone else's problem. Sessions, user
+profiles by ID, a URL shortener's `code → url`, IoT readings by `device_id` +
+timestamp, an [idempotency-key](/knowledge-base/generating-unique-ids-short-codes/#what-youre-actually-choosing-between)
+table.
+
+Three things that decide real designs:
+
+- **Hot partitions.** Throughput is per-partition, not just per-table. A partition key
+  like `date` or `country=US` funnels traffic to one partition and throttles while the
+  table sits idle overall. Fix by choosing a high-cardinality key, or salting.
+- **Item size rounds up.** Writes bill per 1 KB, reads per 4 KB, **rounded up per
+  item**. A 1,100-byte item costs 2 WCUs; trimming it to under 1 KB halves your write
+  bill. And `Query` rounds across the aggregate while `GetItem` rounds per item, which
+  makes fetching 20 related items under one partition key ~10× cheaper as one `Query`
+  than as 20 `GetItem`s.
+- **TTL deletion lags** up to 48 hours, so **check expiry at read time**. Assuming the
+  row is gone is a real bug.
+
+**Reject it when** you need ad-hoc queries, or when the entity count is small and
+relationships matter. "We'll add a GSI for that" stops being an answer around the
+fourth GSI.
+
+### MongoDB
+
+> Document store. Flexible schema, and a natural fit when your aggregate is genuinely
+> one nested object.
+
+The legitimate case: documents with **varying shapes** where the whole thing is read
+and written together — a product catalog where every category has different
+attributes, a CMS, an event payload whose schema you don't control. Rich queries on
+any field (unlike DynamoDB), horizontal sharding (unlike single-node Postgres), and
+ACID transactions since 4.0.
+
+**Be careful naming it in an interview.** The justification has to be more specific
+than "the schema might change" — see the rejection below, which is the response you
+should expect.
+
+### Redis
+
+> In-memory. Microsecond latency, rich data structures, and **not your source of
+> truth**.
+
+The right jobs: [caching](/knowledge-base/caching-strategies-invalidation/), sessions,
+rate limiter counters, leaderboards (sorted sets), distributed locks, ephemeral
+presence, lightweight queues. Data structures — sorted sets, HyperLogLog, streams —
+are the underrated part; a leaderboard is one `ZADD` and one `ZRANGE`, which is a
+different problem in SQL.
+
+The constraints are the whole story: **memory-bound** (your dataset must fit in RAM,
+priced accordingly), and **persistence is best-effort** — RDB snapshots lose the window
+since the last save, AOF is better but still not a durable commit. Which is why Redis
+is never [the single source of truth](/knowledge-base/system-design-principles-tenets/#single-source-of-truth).
+
+Worth one line in any read-heavy design: a cache in front of the database is usually
+the *first* scaling move, and it's cheaper than changing datastores.
+
+### S3 and object storage
+
+> Not a database. The answer for anything large and immutable, and the reason your
+> database stays small.
+
+Images, video, PDFs, receipts, ML model artifacts, logs, backups, parquet files. The
+database stores a **key**; the bytes live in S3, GCS, or Azure Blob — interchangeable
+for design purposes, so pick whichever matches your stack and don't spend interview
+time on it.
+
+What you get: unlimited capacity, 11 nines of durability, and ~$0.023/GB-month — about
+10× cheaper than block storage, 100× cheaper than DynamoDB. Plus lifecycle rules that
+tier cold data to Glacier on their own.
+
+What you don't get: **no queries** (list-by-prefix is all there is, so metadata and
+search live in your database), **no partial updates** — an object is replaced whole —
+and per-request latency in the tens of milliseconds rather than single digits.
+
+The pattern that matters in interviews:
+
+```
+1. client asks the API for an upload target
+2. API authorizes, returns a presigned PUT URL
+3. client uploads bytes directly to S3        ← never through your servers
+4. client registers the object key with the API
+```
+
+**The API still authorizes.** "S3 handles access control" is wrong — S3 has no idea who
+manages whom or which tenant a user belongs to. Your service checks permission and
+*then* mints a short-lived URL. Also: store the **key**, never the presigned URL — it
+expires, so a persisted URL works in testing and 404s a week later.
+
+### The specialists
+
+Each of these exists because a general-purpose database does one thing badly enough to
+justify another moving part. Name them when the access pattern demands it — and be
+aware that adding one is a real operational cost, so it needs a reason.
+
+| Store | The job it wins | Why not Postgres |
+| --- | --- | --- |
+| **Elasticsearch / OpenSearch** | Full-text search, relevance ranking, faceting | Postgres FTS is fine to ~millions of docs; ES wins on relevance tuning and aggregations |
+| **Cassandra** | Enormous write throughput, multi-region active-active | No single primary; tunable consistency per query |
+| **Kafka** | Ordered, replayable stream of events | It's a log, not a database — durable, replayable, but no queries |
+
+Two notes on that table. **Cassandra vs DynamoDB** is largely self-managed vs managed:
+same architectural family (both descend from the Dynamo paper), so pick DynamoDB on
+AWS unless you need multi-cloud or have specific tuning needs. And **Kafka is the
+common miss** — for "a stream of changing data" the right answer is often *both*: Kafka
+as the durable event log, plus a database or cache holding the current materialized
+state.
+
+## Mapping problems to stores
+
+The interview shortcut, with the reasoning that makes each one defensible:
+
+| Problem | Choice | Because |
+| --- | --- | --- |
+| **User accounts, profiles, auth** | Postgres | Relational, needs uniqueness constraints, low volume |
+| **Payments, ledgers, transfers** | Postgres | Multi-row atomicity is non-negotiable; auditability; correctness over throughput |
+| **Bookings, seat/inventory reservation** | Postgres | The whole problem is a race condition — needs `UNIQUE` constraints and [isolation](/knowledge-base/database-transactions-acid/#isolation-levels) |
+| **Sessions, tokens, rate limits** | Redis | Ephemeral, TTL-native, microsecond reads, loss is survivable |
+| **URL shortener, key→value lookup** | DynamoDB | Pure point lookup by key, huge volume, no relationships |
+| **Product catalog, CMS content** | Postgres + `JSONB`, or Mongo | Varying shapes, read-heavy; Mongo only if truly document-shaped |
+| **Search, autocomplete, filtering** | Elasticsearch + a system of record | Relevance ranking and faceting; ES is a projection, never the truth |
+| **Stock ticks, metrics, IoT readings** | DynamoDB, partitioned by `device_id` + timestamp | Append-only, always read as a time range under a known key |
+| **Live stock prices for display** | Redis (current value) + Kafka (the stream) | Two different questions: what is it now, and what changed |
+| **Media files, receipts, documents** | S3 + metadata row in Postgres | Blobs never live in a database |
+| **Chat and message history** | Cassandra or DynamoDB | Huge write volume, always read by `conversation_id` + time range |
+| **Feeds and timelines** | Postgres/Dynamo for posts + Redis for the fanned-out feed | Feed is derived state; recompute it, don't store it as truth |
+| **Analytics, dashboards, reporting** | A separate read replica, or a warehouse | Never the primary — heavy scans would crush your transactional database |
+| **Social graph, follows** | Postgres join table | A follow is one hop; foreign keys already model it |
+
+The pattern worth extracting: **most real systems use two or three of these, not
+one.** "Postgres for the entities, S3 for the blobs, Redis for the hot reads" is a
+complete and strong answer to a great many problems. Naming a **system of record** and
+then describing the others as derived, disposable projections is the framing that makes
+a multi-store design sound deliberate rather than accumulated.
+
+## Popular answers worth rejecting
+
+Interviewers listen for whether you can decline a fashionable option. Each of these is
+a rejection with a specific reason attached:
+
+**"MongoDB because the schema might evolve."** Postgres `JSONB` gives you schemaless
+columns *and* joins, constraints, and transactions. Schema flexibility alone doesn't
+justify losing referential integrity — and if the data has relationships, Mongo makes
+you join in application code.
+
+**"Cassandra/DynamoDB because we need scale."** Compute the QPS first. Thousands of
+writes per second is a single Postgres box. Adopting a NoSQL store for scale you can't
+demonstrate costs you joins, constraints and ad-hoc queries in exchange for headroom
+you don't need yet.
+
+**"Redis as the primary datastore because it's fast."** Memory-bound and
+persistence is best-effort. Fine as a cache or for ephemeral state; a durability bug
+waiting to happen as a source of truth.
+
+**"Elasticsearch as the database."** It's a search index — no transactions, and
+reindexing is a routine operation. Always pair it with a system of record and treat the
+index as a rebuildable projection.
+
+**"A graph database because there are relationships."** Foreign keys are
+relationships. "Users follow users" is a join table.
+
+**"Blobs in the database, it's simpler."** It bloats backups, wrecks the buffer pool,
+and makes replication slow. S3 plus a key is barely more code and orders of magnitude
+cheaper.
+
+<Aside title="Polyglot persistence has a real price">
+Each additional datastore is another thing to operate, monitor, back up, secure, and
+keep consistent — plus a dual-write problem at every boundary. Two stores with a clear
+system of record is usually right. Five is usually a design that grew rather than one
+that was chosen.
+</Aside>
+
+## The decision list
+
+Work down and stop at the first match:
+
+1. **Large binary or immutable files** → **S3/GCS**, always, with metadata in a
+   database. Orthogonal to everything below.
+2. **Ephemeral and loss-survivable** — sessions, rate limits, caches → **Redis**.
+3. **Multi-record atomicity is central** — money, inventory, bookings →
+   **Postgres/MySQL**. Don't trade this for throughput you haven't measured.
+4. **Ad-hoc queries, joins, or engine-enforced constraints** → **Postgres/MySQL**.
+5. **Almost always accessed by known key, at large or spiky volume** → **DynamoDB**.
+6. **Relevance-ranked text search** → **Elasticsearch**, as a projection.
+7. **A durable, replayable event stream** → **Kafka**, plus a store for current state.
+8. **None of the above** → **Postgres**. Then add a cache before another datastore.
+
+Two habits make any of these land better: **state your choice's weakness before you're
+challenged on it**, and **name the migration path** — "start on Postgres; if the events
+table outgrows it, that table alone moves to Dynamo."
+
+## At a glance
+
+| Store | Model | Transactions | Scales writes by | Query flexibility | Reach for |
+| --- | --- | --- | --- | --- | --- |
+| **PostgreSQL / MySQL** | Relational | Full ACID | Vertically; sharding is manual | Highest | The default |
+| **DynamoDB** | Key-value / wide-column | 100 items, 2× cost | Horizontally, automatic | Key access only | Known-key lookups at scale |
+| **MongoDB** | Document | Full ACID (4.0+) | Horizontally, sharding | Rich on any field | Genuinely document-shaped data |
+| **Cassandra** | Wide-column | Lightweight only | Horizontally, no primary | Partition key only | Massive writes, multi-region |
+| **Redis** | In-memory structures | Atomic, not durable | Cluster / hash slots | By key + structure ops | Cache, sessions, counters |
+| **Elasticsearch** | Inverted index | None | Horizontally, shards | Full-text + aggregations | Search, as a projection |
+| **S3 / GCS** | Object store | Per object | Effectively unlimited | Prefix listing only | Blobs, always |
+| **Kafka** | Append-only log | Per partition | Horizontally, partitions | Sequential replay only | Event streams |
+
+The model worth keeping: **the access pattern picks the database, not the data model
+and not the scale you hope to reach.** Choose the store whose cheap operation is your
+common operation, then be able to say what it's bad at — a defensible boring answer
+beats an exciting one every time.
