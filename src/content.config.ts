@@ -15,6 +15,9 @@ const postSchema = ({ image }: { image: () => z.ZodType }) =>
 		tags: z.array(z.string()).default([]),
 		// Pin a post to the "Featured" row on the landing page.
 		featured: z.boolean().default(false),
+		// Work in progress: visible on localhost, excluded from production builds.
+		// See `src/lib/content.ts`.
+		draft: z.boolean().default(false),
 	});
 
 const blog = defineCollection({

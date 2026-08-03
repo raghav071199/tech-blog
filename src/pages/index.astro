@@ -1,6 +1,5 @@
 ---
 import { Image } from 'astro:assets';
-import { getCollection } from 'astro:content';
 import bannerImage from '../assets/london-banner.jpeg';
 import profilePhoto from '../assets/profile-photo-1.jpeg';
 import BaseHead from '../components/BaseHead.astro';
@@ -13,8 +12,9 @@ import {
 	SITE_TITLE,
 	SOCIAL_LINKS,
 } from '../consts';
+import { getPosts } from '../lib/content';
 
-const posts = (await getCollection('blog')).sort(
+const posts = (await getPosts('blog')).sort(
 	(a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf(),
 );
 
