@@ -24,6 +24,42 @@ Three content collections (`src/content.config.ts`), all sharing one frontmatter
 Cross-link between sections liberally, and deep-link to specific headings when
 referencing one concept (e.g. `/knowledge-base/solid-principles/#o--openclosed-principle`).
 
+### Two shapes of Knowledge Base note
+
+The KB holds two distinct kinds of note. Decide which one you're writing before the
+first heading, because the closing section differs.
+
+**Reference notes** ("survey" shape) — cover a *space* of options: several stores,
+several protocols, several patterns, and the criteria for choosing between them. These
+are the longer notes (~1,500–3,000 words), organised as one `###` per option, and they
+**close with an "At a glance" table** — the table is the payoff, since the whole point
+is comparison. `choosing-a-database`, `rest-graphql-grpc`, `design-patterns`.
+
+**Concept notes** ("single idea" shape) — one small concept explained end to end, under
+~1,000 words, meant to be read in one sitting rather than scanned. Arc:
+
+1. **The problem** — the situation where the concept becomes necessary. Often a design
+   that is fine until it scales, so show it working first.
+2. **The subpar design** — the obvious approach, stated fairly, then the specific point
+   at which it breaks. Concrete numbers over adjectives (`Scan reads 10,000,000 items
+   to return 12`, `500 WCU per partition while 9,500 sit idle`).
+3. **The concept, and what it costs** — what it actually is, and the trade it makes.
+   Every concept costs something; a note that doesn't name the cost isn't finished.
+4. **A worked example** — one real scenario carried through, ideally including a case
+   that deliberately does *not* get the treatment, and why.
+5. **When to reach for it, and when it's overkill** — both directions, explicitly. The
+   overkill half is the more useful one and the more commonly omitted.
+6. **A one-paragraph close** — the transferable model in a sentence, bolded.
+
+**No "At a glance" table in a concept note.** The whole note is already the summary;
+a table restating a 900-word post is padding. This is a deliberate exception to the
+reference-note convention above, not an oversight. `global-secondary-indexes`,
+`hot-partitions`.
+
+Concept notes pair naturally — a mechanism and its failure mode, a pattern and its
+cost. Cross-link them to each other rather than repeating the shared background, and
+push anything survey-shaped out to the relevant reference note.
+
 ### Design Review posts (`Design Review` tag)
 
 A Blog sub-genre for API/system design walkthroughs, often grown out of interview
