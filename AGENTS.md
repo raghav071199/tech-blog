@@ -87,6 +87,28 @@ at specific anchors instead of re-explaining verbs, status codes, or `ETag`s.
 There is no `src/pages/tags/` route — tags render as display-only chips, so a new tag
 is just a frontmatter string with no route to add.
 
+## Drafts
+
+`draft: true` in frontmatter means **visible on localhost, absent from production**.
+Unfinished posts live on `main` rather than in a branch or a scratch directory.
+
+The filtering happens in one place — `getPosts()` in `src/lib/content.ts`, a thin
+wrapper over `getCollection` that drops drafts unless `import.meta.env.DEV`. **Every
+page uses `getPosts`, never `getCollection` directly**, including inside
+`getStaticPaths`. That last part is what makes this real rather than cosmetic: a draft
+gets no route in a production build, so there's no unlisted-but-reachable URL, and
+nothing to leak into the sitemap or RSS feed.
+
+Adding a new page that lists content? Import `getPosts`. If you find yourself reaching
+for `getCollection` in `src/pages/`, that's the mistake this section exists to prevent.
+
+Two conveniences: index pages show a small `Draft` chip beside the title (dev only,
+since drafts never reach a production build), and `SHOW_DRAFTS=true astro build`
+includes drafts in a build when you want to check one in production conditions.
+
+Publishing is deleting the `draft: true` line — no file moves, so the slug the draft
+was written against is the slug it ships with.
+
 ## Writing MDX
 
 Shared components: `import Aside from '../../components/Aside.astro'` and
