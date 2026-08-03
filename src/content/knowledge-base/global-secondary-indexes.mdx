@@ -1,0 +1,130 @@
+---
+title: 'Global Secondary Indexes'
+description: 'Why a key-value store needs a second way in — what a GSI is, what it costs, and the point in a design where reaching for one is right versus the point where it means your table is wrong.'
+pubDate: 'Aug 3 2026'
+updatedDate: 'Aug 3 2026'
+tags: ['System Design', 'Databases', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+A [DynamoDB table](/knowledge-base/choosing-a-database/#dynamodb) is fast because it
+only knows how to do one thing: find items by their partition key. That's also the
+problem — the moment a second access pattern appears, the key you chose can't serve it.
+
+A **Global Secondary Index** is a second view of the same table under a different key.
+
+## The problem it solves
+
+Take an orders table keyed by `order_id`:
+
+```text
+PK: order_id
+    { order_id, customer_id, status, total, created_at }
+```
+
+`GET /orders/{id}` is a single fast lookup. Then the product asks for "my orders" —
+`customer_id` isn't the key, so the only way to answer is scanning every order in the
+table and discarding almost all of them.
+
+```text
+Query  by order_id     → reads 1 item
+Scan   by customer_id  → reads 10,000,000 items to return 12
+```
+
+A scan is O(table): it slows down as you grow and competes with real traffic for
+throughput. Not a query you can ship.
+
+## What a GSI actually is
+
+A GSI is a **separate table that DynamoDB maintains for you**, holding a copy of your
+data under a different key:
+
+```text
+Base table          PK: order_id
+GSI "by-customer"   PK: customer_id,  SK: created_at
+```
+
+Every write to the base table is asynchronously replicated into the index. Now "this
+customer's orders, newest first" is a `Query` on the GSI — one partition, a contiguous
+range, no scan.
+
+Three properties follow from it being a separate table:
+
+- **The GSI key needn't be unique.** Many orders share a `customer_id`; that's the point.
+- **It's eventually consistent, always.** Replication is asynchronous, so a strongly
+  consistent read of a GSI isn't offered — not a tuning option, a structural fact.
+- **You choose what it holds.** `KEYS_ONLY`, specific attributes, or `ALL`. Omit an
+  attribute your query needs and every item costs a second fetch against the base table.
+
+## What it costs
+
+This is the part that decides whether to use one:
+
+| | Cost |
+| --- | --- |
+| **Storage** | A second copy of every projected attribute |
+| **Writes** | Every base write also writes each GSI — **1 write becomes N+1** |
+| **Consistency** | Eventually consistent, with no strong option |
+| **Hot partitions** | A low-cardinality GSI key (e.g. `status`) funnels traffic to one partition |
+
+The write multiplication is the one that surprises people: four GSIs mean every order
+insert performs and bills for five writes — on a write-heavy table, the dominant cost of
+the design.
+
+<Aside title="A GSI on a low-cardinality attribute is a trap">
+Indexing `status` looks reasonable until you notice most orders are `PENDING`. They all
+land in one partition, which throttles while the rest of the index sits idle. A key with
+few possible values needs a composite — `status#2026-08` — to spread the load.
+</Aside>
+
+## When to reach for one
+
+**Use a GSI when** you have a genuinely different, well-understood access pattern
+against the same entity — read-heavy, tolerant of a second or two of staleness, on an
+attribute with high cardinality. "My orders," "posts by author," "unprocessed jobs by
+priority."
+
+**Don't, when:**
+
+- **It's a one-off admin query.** Accept the scan, off-peak.
+- **You need read-your-own-write.** After placing an order, read it by `order_id` from
+  the base table, not the by-customer GSI — the write may not have propagated. The user
+  submits, the list refreshes, their order is missing.
+- **You're on your fourth one.** Two or three GSIs is a table serving several access
+  patterns. Six means the data is relational and you're rebuilding query planning by
+  hand — the [honest answer](/knowledge-base/choosing-a-database/#popular-answers-worth-rejecting)
+  is often Postgres, where an index is one statement and joins already exist.
+
+<Aside title="In an interview, say the write cost out loud">
+"A GSI on `customer_id` for order history — each order becomes two writes, and the list
+can lag a second, which is fine here" is a complete answer. Naming a GSI without naming
+its cost is the tell that it's a memorized move rather than a decision.
+</Aside>
+
+## A worked example
+
+A ride-hailing service. Rides are keyed by `ride_id`; three screens need the data:
+
+| Screen | Access pattern | Serve it with |
+| --- | --- | --- |
+| Ride detail | By `ride_id` | Base table |
+| Passenger's history | By `passenger_id`, newest first | GSI: `passenger_id` + `started_at` |
+| Driver's earnings | By `driver_id`, by day | GSI: `driver_id` + `started_at` |
+
+Two GSIs, so every ride write costs three. That's defensible: rides are written once
+and read many times by both parties, and neither history screen breaks if it's a second
+behind.
+
+Now note what does *not* get a GSI. "All rides currently in progress" is tempting —
+but `status` has four values, so that index would be a hot partition by construction,
+and a dispatch system needs fresher data than an eventually consistent index provides.
+That belongs in [Redis](/knowledge-base/three-database-stacks/#stack-1--postgres--redis),
+holding the small, fast-changing set of active rides. **A GSI is for a different way in
+to your data, not for a different freshness requirement.**
+
+The model worth keeping: **a GSI trades write cost and freshness for a query you
+otherwise couldn't run.** Enumerate the access patterns first, index the ones that are
+read-heavy and staleness-tolerant, and treat needing many of them as evidence you chose
+the wrong database.
