@@ -1,0 +1,232 @@
+---
+title: 'Three Database Stacks That Cover Most Systems'
+description: 'Rather than picking a store per problem, recognise which of three combinations you are in — transactional core, media and content, or high-volume key access — and what each one costs you.'
+pubDate: 'Aug 2 2026'
+updatedDate: 'Aug 2 2026'
+tags: ['System Design', 'Databases', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+[Choosing a Database](/knowledge-base/choosing-a-database/) works store by store. In
+practice you almost never choose one store — you choose a **combination**, and there
+are only about three that matter. Recognising which one a problem is asking for is
+faster than reasoning from first principles, and it's usually the shape a good design
+lands on anyway.
+
+| Stack | Covers | Typical problems |
+| --- | --- | --- |
+| **1. Transactional core** — Postgres + Redis | State that must be correct | Bookings, payments, accounts, orders |
+| **2. Media and content** — Postgres + S3 + CDN | Anything with files | Uploads, avatars, video, receipts |
+| **3. High-volume key access** — DynamoDB (+ Redis) | Huge write volume, known key | Chat, feeds, telemetry, short links |
+
+Most real systems are stack 1, some are stack 1 plus stack 2, and stack 3 shows up
+when the numbers genuinely demand it. What follows is what each one is, why the pieces
+fit, and where each one breaks.
+
+## Stack 1 — Postgres + Redis
+
+> The default. Postgres is the source of truth; Redis absorbs the reads and holds
+> anything ephemeral.
+
+This is the answer to most system design questions, and being able to say so without
+apologising is a senior signal.
+
+```text
+client → API → Redis  (hit: return)
+              ↓ miss
+            Postgres  → populate Redis → return
+```
+
+**Postgres owns** entities and their relationships, and every invariant that spans
+rows: `UNIQUE (member_id, class_id)` so one member can't double-book,
+[transactional](/knowledge-base/database-transactions-acid/#isolation-levels) balance
+transfers, foreign keys that stop orphaned records existing at all.
+
+**Redis owns** three distinct jobs that people tend to collapse into one:
+
+| Job | Why Redis | Loss tolerable? |
+| --- | --- | --- |
+| **Cache** of hot reads | Removes repeated identical queries | Yes — repopulates on miss |
+| **Ephemeral state** — sessions, tokens, presence | TTL is native | Yes — user re-authenticates |
+| **Counters** — rate limits, view tallies | Atomic `INCR`, no round trip to disk | Yes — approximate is fine |
+
+Notice every row says loss is tolerable. That's the discipline: nothing lives *only*
+in Redis. The moment something does, you've turned a cache into an undurable primary.
+
+**Why the pair works.** A single well-provisioned Postgres handles tens of thousands
+of writes per second, and reads — the part that actually scales badly — get absorbed by
+Redis before they arrive. So the ceiling you hit first is *write* throughput, and most
+products never reach it.
+
+**Where it breaks:** writes go to one primary. Read replicas buy you read scale but not
+write scale, and sharding Postgres is genuinely painful. When writes are the
+constraint, you're in stack 3.
+
+<Aside title="Add the cache when reads hurt, not on day one">
+Cache-aside plus write-around plus a TTL backstop is the combination worth defaulting
+to — see [caching strategies](/knowledge-base/caching-strategies-invalidation/#write-strategies).
+But an empty Postgres with no cache is a perfectly good v1, and adding Redis later is a
+day of work. Adding it before you have a hit ratio to justify it means you now own
+[invalidation](/knowledge-base/caching-strategies-invalidation/#invalidation) bugs for
+no measured benefit.
+</Aside>
+
+## Stack 2 — Postgres + S3 + CDN
+
+> The database holds a key. The bytes live in object storage. Clients upload and
+> download without touching your servers.
+
+Any product with images, video, PDFs, receipts, or exports is in this stack, and the
+whole design is one rule: **the bytes never pass through your API**.
+
+The reason is arithmetic. 10M uploads a month at 2 MB each is 20 TB — route that
+through your application tier and your servers spend their lives as a proxy, request
+timeouts have to accommodate cellular uploads, and a retried 2 MB upload costs you the
+full 2 MB again.
+
+### The presigned URL flow
+
+```text
+1. POST /v1/uploads          → API authorizes, returns { uploadUrl, fileId }
+2. PUT  <uploadUrl>          → client sends bytes straight to S3
+3. POST /v1/documents        → client registers { fileId }; API writes the row
+```
+
+A presigned URL is a time-limited, operation-scoped credential: it embeds a signature
+authorizing exactly one `PUT` to exactly one object key, expiring in minutes. The
+bucket stays private; the URL is the only way in.
+
+Four things decide whether this is implemented correctly:
+
+**Your API authorizes, S3 does not.** "Object storage handles access control" is the
+single most common mistake here. S3 has no idea who manages whom or which tenant a
+user belongs to. Your service evaluates permission and *then* mints a URL. S3's only
+job is being unreachable without one.
+
+**Store the key, never the URL.** Presigned URLs expire, so a URL persisted in a
+`file_url` column works all through testing and 404s a week later. Store
+`s3://bucket/key` and sign a fresh URL on every read.
+
+**Let the client choose the key before uploading.** Then a mid-upload retry overwrites
+the same object rather than creating a duplicate — the upload is
+[idempotent](/knowledge-base/idempotency-retries-backoff/#idempotency-keys) by
+construction, which matters when clients are on mobile networks.
+
+**The row is written after the upload, not before.** Otherwise a failed upload leaves a
+database row pointing at an object that doesn't exist. If you must create the row
+first, mark it `pending` and have the registration step promote it.
+
+Downloads are the mirror image: presigned `GET` URLs for private files, or a CDN in
+front of the bucket for public ones. Either way the file path never touches your
+application.
+
+<Aside title="Everything queryable stays in Postgres">
+S3 has no queries — prefix listing is all there is. So filename, owner, size, content
+type, upload time, tags, and permissions all live in a database row alongside the key.
+"Show me this user's receipts from July" is a SQL query that happens to return keys.
+</Aside>
+
+**Where it breaks:** nowhere, really — this is the one stack with no serious
+alternative. The failure mode is skipping it, and paying for it in bandwidth and
+timeouts. The real complexity that remains is *processing*: thumbnails, transcoding,
+virus scanning and OCR all belong in an async worker triggered by the upload, never in
+the request path. (A [design review](/blog/designing-an-expense-api-provenance/) of one
+such flow, where OCR and users write to the same fields.)
+
+## Stack 3 — DynamoDB, optionally with Redis
+
+> When the write volume genuinely exceeds one primary, and access is always by a key
+> you know in advance.
+
+The trade is explicit: you give up joins, ad-hoc filters, and cheap multi-row
+transactions, and you get horizontal write scale with predictable single-digit
+millisecond latency. That's a bad trade unless you actually need the scale — which is
+why this stack is third, not first.
+
+It fits when **the access pattern is narrow and known**:
+
+| Problem | Partition key | Sort key |
+| --- | --- | --- |
+| Chat history | `conversation_id` | `timestamp` |
+| Device telemetry | `device_id` | `timestamp` |
+| Short links | `short_code` | — |
+| Sessions | `session_id` | — |
+| A user's activity feed | `user_id` | `timestamp` |
+
+Every row is the same shape: one key identifies a partition, and you read a contiguous
+time range inside it. No query in that list needs a join, which is the actual
+precondition for this stack.
+
+Three things that decide real designs here:
+
+- **Hot partitions.** Throughput is per-partition. A key like `date` or `country`
+  funnels all traffic to one partition and throttles while the table sits idle overall.
+  Choose a high-cardinality key.
+- **Item size rounds up.** Writes bill per 1 KB, reads per 4 KB, rounded up *per item*.
+  A 1,100-byte item costs 2 WCUs; trimming under 1 KB halves the bill. And one `Query`
+  returning 20 items rounds across the aggregate, making it far cheaper than 20
+  `GetItem` calls.
+- **TTL deletion lags** up to 48 hours, so check expiry at read time.
+
+**Redis still has a place here**, but a different one: DynamoDB is already fast, so you
+add Redis for the *very* hot key (a viral short link, a trending feed) or for
+structures Dynamo doesn't have — sorted sets for leaderboards, atomic counters for rate
+limits.
+
+**Where it breaks:** the query you didn't plan for. Adding one means a new index or a
+full table scan, and "we'll add a GSI" stops being an answer around the fourth GSI. If
+requirements are still moving, this stack will hurt.
+
+## Which one am I in?
+
+Three questions, in order:
+
+1. **Are there files?** → you need stack 2, *in addition to* whichever of 1 or 3 holds
+   your entities. Stack 2 is never the whole answer.
+2. **Do multiple records have to change together, or do you need ad-hoc queries?** →
+   stack 1. Don't trade this away for throughput you haven't calculated.
+3. **Have you computed the write volume and it genuinely exceeds one primary?** →
+   stack 3.
+
+If you can't answer 3 with a number, you're in stack 1.
+
+Worth saying out loud: **a great many production systems are stack 1 plus stack 2 and
+nothing else.** "Postgres for the entities, S3 for the files, Redis in front of the
+reads" is a complete, defensible answer to most problems — and naming Postgres as the
+**system of record** while describing the others as derived or disposable is what makes
+a multi-store design sound deliberate rather than accumulated.
+
+## What these three don't cover
+
+Being honest about the gap matters more than stretching the list:
+
+- **Relevance-ranked search** — "find me all invoices mentioning consultancy" isn't
+  `LIKE '%...%'`. Postgres full-text search covers you to a few million documents;
+  past that it's Elasticsearch, always as a rebuildable projection of a system of
+  record.
+- **Reporting and analytics** — scans and aggregations over the whole table will
+  degrade your transactional database. Point them at a read replica, or a warehouse.
+- **Event streams and integration** — when several consumers each need the same
+  ordered, replayable sequence of changes, that's Kafka, alongside a store holding
+  current state.
+
+Each of those is a **fourth component added to one of the three stacks**, never a
+replacement for it. That framing is the useful part: you're not choosing between four
+architectures, you're deciding whether a problem needs one more moving part.
+
+## At a glance
+
+| | Stack 1 | Stack 2 | Stack 3 |
+| --- | --- | --- | --- |
+| **Components** | Postgres + Redis | Postgres + S3 + CDN | DynamoDB (+ Redis) |
+| **Source of truth** | Postgres | Postgres (S3 for bytes) | DynamoDB |
+| **Reach for it when** | Anything stateful and correct | Any files at all | Writes exceed one primary |
+| **Scales by** | Read replicas, then vertically | S3 is effectively unlimited | Horizontal partitions |
+| **Gives up** | Write scale past one primary | Nothing — it's additive | Joins, ad-hoc queries |
+| **Signature mistake** | Treating Redis as durable | Bytes through your API | Choosing it before the numbers justify it |
+
+The model worth keeping: **stack 1 unless files or measured write volume say otherwise,
+and stack 2 is additive rather than an alternative.** Naming the combination and then
+naming what it gives up is a stronger answer than naming a database.
