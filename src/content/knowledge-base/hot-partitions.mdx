@@ -1,0 +1,119 @@
+---
+title: 'Hot Partitions'
+description: 'Why a table with plenty of spare capacity still throttles — where partition heat comes from, the fixes in order of preference, and why read heat and write heat are different problems.'
+pubDate: 'Aug 3 2026'
+updatedDate: 'Aug 3 2026'
+tags: ['System Design', 'Databases', 'Reference']
+featured: false
+---
+
+import Aside from '../../components/Aside.astro';
+
+The most confusing failure in a partitioned datastore is a table that throttles while
+its dashboard says it's using a fraction of its capacity. The cause is almost always the
+same: **throughput is per-partition, not per-table.**
+
+## What a hot partition is
+
+A partitioned store splits your data across many physical partitions by hashing the
+partition key. Capacity is divided along with it:
+
+```text
+Table provisioned:  10,000 WCU across 20 partitions
+Per partition:         500 WCU
+All writes to one key: throttled at 500, while 9,500 WCU sit idle
+```
+
+That's a hot partition — one partition receiving a share of traffic far larger than its
+share of capacity. You don't get a "table is full" error. You get throttling,
+[retries](/knowledge-base/idempotency-retries-backoff/#backoff-and-jitter), tail latency,
+and a capacity graph that looks fine.
+
+## Where the heat comes from
+
+Four causes, and they're all decided when you choose the key:
+
+| Cause | Example | Why it lands on one partition |
+| --- | --- | --- |
+| **Low cardinality** | `status`, `country`, `tenant_type` | Few distinct values, so few partitions |
+| **Time-ordered key** | `date`, an auto-increment ID | Everything written today shares a key |
+| **A popular item** | A viral post, a celebrity account | One key, real traffic, nothing wrong with the schema |
+| **Tenant skew** | One enterprise customer, 1,000× the rest | Key is high-cardinality but the *distribution* isn't |
+
+The last two are worth separating from the first two. Low cardinality and time-ordering
+are design mistakes — you can see them before you ship. Popularity and skew are
+properties of the world, and no key choice makes them go away.
+
+<Aside title="Read heat and write heat are different problems">
+Read heat is easy: put a [cache](/knowledge-base/caching-strategies-invalidation/#why-cache)
+or a read replica in front of it, and one hot key becomes one cache entry serving
+millions of requests. Write heat has no such escape — a cache can't absorb a write — so
+it has to be fixed at the key. When you spot heat, establish which one you have before
+reaching for a fix.
+</Aside>
+
+## Fixing it
+
+In order of preference, because the cheap fixes are the early ones:
+
+**1. Choose a higher-cardinality key.** Free at design time, a migration later. If a key
+has fewer distinct values than you have partitions, it's the wrong key.
+
+**2. Make it composite.** A low-cardinality attribute you genuinely need to query can be
+widened by concatenating something that varies: `status#2026-08-03` instead of `status`.
+Queries now target a specific day rather than the whole status, which is usually what
+they wanted anyway.
+
+**3. Shard the key with a suffix.** For a single unavoidably hot key, write to
+`post_id#{0..N}` picked at random. Writes spread across N partitions; the cost is that
+reads become a scatter-gather over all N and have to be merged. Pick N from the observed
+skew — 10, not 1,000.
+
+**4. Aggregate before writing.** For counters, don't write per event. Increment in Redis
+and flush a total periodically. 50,000 likes per second becomes one write per second, and
+the hot key is now in a store designed to be hot.
+
+## Adaptive capacity, honestly
+
+DynamoDB will detect an imbalanced partition and give it more throughput — up to 3,000
+RCU / 1,000 WCU for a single partition — and will eventually split a partition that stays
+hot. So mild, gradual skew often self-heals.
+
+Two reasons not to plan around it: it's a **ceiling, not elasticity** (a key needing
+5,000 WCU still throttles), and it reacts over minutes, which is longer than the traffic
+spike that caused the problem. It saves you from moderate skew, not from a bad key.
+
+## A worked example
+
+A likes counter. The obvious design keys by `post_id`:
+
+```text
+PK: post_id  →  { post_id, like_count }
+```
+
+Every like on a post is a write to one item in one partition. Normal posts are fine. Then
+one post reaches the front page at 50,000 likes per second — a single partition, throttled
+immediately, and the failure is visible precisely when the product is working.
+
+Two fixes, and the choice between them is a product question:
+
+- **Shard the counter** into `post_id#{0..99}`, each row holding a partial count. Writes
+  spread 100 ways; a read sums 100 rows. Exact, durable, 100× the read cost.
+- **Count in Redis** with `INCR`, flush to the database every few seconds. One hot key in
+  memory, cheap reads, and the count can lag a second or lose the last window.
+
+For a like count, Redis is right — it's a number nobody audits. For something that has to
+reconcile, shard the counter and pay the reads.
+
+## Bringing it up in a design
+
+The habit worth building: **the moment you name a partition key, say its cardinality and
+its distribution out loud.** "Keyed by `device_id` — millions of devices, roughly even, so
+no hot partition" is one clause and it closes the question. It also catches the
+[GSI version](/knowledge-base/global-secondary-indexes/#what-it-costs) of the same
+mistake, which is easier to make because the index key gets less thought than the table's.
+
+The model worth keeping: **aggregate capacity is not available capacity.** Every
+partitioned store hands you a fraction of the total per key, so the question is never
+"can the table take this load" but "can one partition take the busiest key's share of
+it."
